@@ -172,6 +172,29 @@ If any section is missing → STOP.
 
 ---
 
+# DETERMINISTIC VISUAL-AUDIT CAPTURE
+
+Windowed diagnostic runs can sample the exact composed framebuffer without
+changing guest state:
+
+- `GBARECOMP_FRAMEDUMP_DIR` selects the output directory.
+- `GBARECOMP_FRAMEDUMP_START`, `GBARECOMP_FRAMEDUMP_STEP`, and
+  `GBARECOMP_FRAMEDUMP_COUNT` select aligned guest frames.
+- `GBARECOMP_DEBUG_LAYER_MASK` isolates BG0..BG3 and OBJ with bits 0..4;
+  the default `0x1F` preserves the normal composite.
+- `GBARECOMP_UNTHROTTLED_CAPTURE=1` removes only the host frame pacer while a
+  framedump is active. It does not skip guest frames.
+- `GBARECOMP_INPUT_REPLAY_EXCLUSIVE=1` makes an active input replay
+  authoritative while the window queue continues to drain. Live controllers,
+  keyboard/mouse input, system hotkeys, and Assist controls are ignored so one
+  Native/Wide pass cannot be perturbed by a connected device.
+
+These are read-only observability controls. A capture audit must still verify
+runtime/static-coverage integrity and must not treat a stable image hash as
+proof that widened content is correct.
+
+---
+
 # WHAT GOES IN THE ALWAYS-ON RING
 
 Every frame snapshot must include enough to reconstruct the divergent

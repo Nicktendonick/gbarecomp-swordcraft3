@@ -45,6 +45,7 @@ extern "C" int (*g_ws_obj_attr_x_provider)(int, std::uint16_t,
 // still run first, so a game can re-place known-safe HUD sprites and clip the
 // rest.
 extern "C" int g_ws_obj_native_clip = 0;
+extern "C" unsigned g_ppu_debug_layer_mask = 0x1Fu;
 
 GbaPpu::GbaPpu()  = default;
 GbaPpu::~GbaPpu() = default;
@@ -536,7 +537,8 @@ void render_scanline_internal(uint8_t* rgb,
         return static_cast<uint16_t>(winout & 0x3Fu);
     };
     auto layer_enabled = [&](uint32_t x, uint32_t layer_bit) -> bool {
-        return (window_control(x) & (1u << layer_bit)) != 0;
+        return (g_ppu_debug_layer_mask & (1u << layer_bit)) != 0 &&
+               (window_control(x) & (1u << layer_bit)) != 0;
     };
     auto blend_enabled = [&](uint32_t x) -> bool {
         return (window_control(x) & (1u << 5)) != 0;
@@ -1058,7 +1060,8 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
     for (uint32_t x = 0; x < out_w; ++x)
         window_controls[x] = static_cast<uint8_t>(window_control(x) & 0x3Fu);
     auto layer_enabled = [&](uint32_t x, uint32_t layer_bit) -> bool {
-        return (window_controls[x] & (1u << layer_bit)) != 0;
+        return (g_ppu_debug_layer_mask & (1u << layer_bit)) != 0 &&
+               (window_controls[x] & (1u << layer_bit)) != 0;
     };
     auto blend_enabled = [&](uint32_t x) -> bool {
         return (window_controls[x] & (1u << 5)) != 0;
