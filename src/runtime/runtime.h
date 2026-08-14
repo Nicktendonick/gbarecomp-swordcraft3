@@ -23,6 +23,17 @@ struct ExtendedViewFrameInfo {
     std::uint32_t extra_right = 0;
     const std::uint8_t* io = nullptr;
     std::size_t io_size = 0;
+    // Read-only guest address spaces for game-owned margin providers. A game
+    // can resolve its original, full map data here without mutating the guest
+    // or teaching the shared renderer about cartridge-specific structures.
+    // Guest addresses retain their normal GBA bases (EWRAM 0x02000000,
+    // IWRAM 0x03000000, ROM 0x08000000).
+    const std::uint8_t* ewram = nullptr;
+    std::size_t ewram_size = 0;
+    const std::uint8_t* iwram = nullptr;
+    std::size_t iwram_size = 0;
+    const std::uint8_t* rom = nullptr;
+    std::size_t rom_size = 0;
 };
 
 // Per-game built-in defaults baked into a game runner at compile time.
