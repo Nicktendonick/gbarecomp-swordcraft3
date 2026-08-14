@@ -45,6 +45,9 @@ extern "C" int (*g_ws_obj_attr_x_provider)(int, std::uint16_t,
 // still run first, so a game can re-place known-safe HUD sprites and clip the
 // rest.
 extern "C" int g_ws_obj_native_clip = 0;
+extern "C" void (*g_ws_frame_postprocess)(std::uint8_t*, std::uint32_t,
+                                            std::uint32_t, std::uint32_t,
+                                            std::uint32_t) = nullptr;
 extern "C" unsigned g_ppu_debug_layer_mask = 0x1Fu;
 
 GbaPpu::GbaPpu()  = default;
@@ -1920,6 +1923,10 @@ void GbaPpu::latch_framebuffer(uint16_t dispcnt,
 
 void GbaPpu::mark_framebuffer_latched() {
     std::memcpy(latched_fb_.data(), work_fb_.data(), render_bytes());
+    if (view_expanded() && g_ws_frame_postprocess) {
+        g_ws_frame_postprocess(latched_fb_.data(), render_width(),
+                               render_height(), extra_left_, extra_right_);
+    }
     has_latched_fb_ = true;
 }
 

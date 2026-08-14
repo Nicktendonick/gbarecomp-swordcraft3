@@ -2355,6 +2355,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         info.extra_right = ppu.view_extra_right();
         info.io = bus.io().raw();
         info.io_size = gba::GbaIo::kIoSize;
+        info.ewram = bus.ewram_ptr();
+        info.ewram_size = 256u * 1024u;
+        info.iwram = bus.iwram_ptr();
+        info.iwram_size = 32u * 1024u;
+        info.rom = bus.rom_ptr();
+        info.rom_size = bus.rom_size();
         opts.extended_view_frame(&info);
     };
     auto apply_runtime_view_width = [&](std::uint32_t target) -> bool {

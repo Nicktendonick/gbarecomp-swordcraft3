@@ -92,6 +92,20 @@ int test_affine_filter(int bg, int) {
 }
 
 int g_bg_x_provider_calls = 0;
+int g_frame_postprocess_calls = 0;
+
+void test_frame_postprocess(uint8_t* rgb, uint32_t width, uint32_t height,
+                            uint32_t extra_left, uint32_t extra_right) {
+    ++g_frame_postprocess_calls;
+    if (!rgb || width != 288 || height != 160 ||
+        extra_left != 24 || extra_right != 24) {
+        std::fprintf(stderr, "frame postprocess: unexpected geometry\n");
+        std::exit(1);
+    }
+    rgb[0] = 0x12;
+    rgb[1] = 0x34;
+    rgb[2] = 0x56;
+}
 
 int test_bg_x_provider(int bg, int output_x, int, int* out_hw_x) {
     ++g_bg_x_provider_calls;
@@ -1028,6 +1042,35 @@ void test_latched_frame_immune_to_in_progress_scanlines() {
                  "latch immunity: frame B backdrop");
 }
 
+void test_frame_postprocess_is_wide_only_and_opt_in() {
+    gba::g_ws_frame_postprocess = test_frame_postprocess;
+    g_frame_postprocess_calls = 0;
+
+    gba::GbaPpu native;
+    native.mark_framebuffer_latched();
+    if (g_frame_postprocess_calls != 0) {
+        std::fprintf(stderr, "frame postprocess: native latch called hook\n");
+        std::exit(1);
+    }
+
+    gba::GbaPpu wide;
+    wide.set_view_margins(24, 24, 0, 0);
+    wide.mark_framebuffer_latched();
+    if (g_frame_postprocess_calls != 1) {
+        std::fprintf(stderr, "frame postprocess: wide latch missed hook\n");
+        std::exit(1);
+    }
+    expect_pixel(wide.latched_framebuffer(), 0x12, 0x34, 0x56,
+                 "frame postprocess: margin marker");
+
+    gba::g_ws_frame_postprocess = nullptr;
+    wide.mark_framebuffer_latched();
+    if (g_frame_postprocess_calls != 1) {
+        std::fprintf(stderr, "frame postprocess: null hook was called\n");
+        std::exit(1);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1053,6 +1096,7 @@ int main() {
     test_affine_reference_reload_overrides_scanline_accumulation();
     test_wide_affine_filter_is_selective_and_bilinear();
     test_latched_frame_immune_to_in_progress_scanlines();
+    test_frame_postprocess_is_wide_only_and_opt_in();
     std::puts("ppu_smoke_tests: PASS");
     return 0;
 }
