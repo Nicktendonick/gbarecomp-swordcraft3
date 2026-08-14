@@ -1416,6 +1416,22 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                         "(recomp backend disabled)\n");
     }
 
+    // Deterministic visual-audit seam. Normal rendering keeps all BG and OBJ
+    // layers; capture tooling can isolate them without changing guest state.
+    gba::g_ppu_debug_layer_mask = 0x1Fu;
+    if (const char* layers = std::getenv("GBARECOMP_DEBUG_LAYER_MASK")) {
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(layers, &end, 0);
+        if (end != layers && *end == '\0') {
+            gba::g_ppu_debug_layer_mask =
+                static_cast<unsigned>(parsed) & 0x1Fu;
+        } else if (!args.quiet) {
+            std::fprintf(stderr,
+                "[gbarecomp:runtime] ignoring invalid "
+                "GBARECOMP_DEBUG_LAYER_MASK='%s'\n", layers);
+        }
+    }
+
 #ifdef GBA_COSIM
     // Start the first-divergence oracle TCP server before the guest runs. The
     // checkpoint hook in runtime_tick parks the guest at cycle-stride boundaries.
@@ -2254,10 +2270,14 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // shows here; a scanout-only tear would not).
     const char* framedump_dir = std::getenv("GBARECOMP_FRAMEDUMP_DIR");
     uint64_t framedump_start = 0;
+    uint64_t framedump_step = 1;
     int framedump_max = 200;
     int framedump_written = 0;
     if (const char* e = std::getenv("GBARECOMP_FRAMEDUMP_START"))
         framedump_start = std::strtoull(e, nullptr, 0);
+    if (const char* e = std::getenv("GBARECOMP_FRAMEDUMP_STEP"))
+        framedump_step = std::max<uint64_t>(
+            1, std::strtoull(e, nullptr, 0));
     if (const char* e = std::getenv("GBARECOMP_FRAMEDUMP_COUNT"))
         framedump_max = std::atoi(e);
     // ── HP-002 frame-phase ring ─────────────────────────────────────────
@@ -2633,7 +2653,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
 #endif
         sync_resize_driven_view();
         if (live_fb.empty()) live_fb.assign(ppu.render_bytes(), 0);
-        pacer.emplace();  // paces to the GBA's 59.7275 Hz
+        const char* unthrottled_capture =
+            std::getenv("GBARECOMP_UNTHROTTLED_CAPTURE");
+        if (!(framedump_dir && unthrottled_capture &&
+              unthrottled_capture[0] && unthrottled_capture[0] != '0')) {
+            pacer.emplace();  // paces to the GBA's 59.7275 Hz
+        }
     }
 
     // Host-window save-state slots: the ROM path with a .stateN extension.
@@ -2706,6 +2731,11 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     const char* input_replay_env = std::getenv("GBARECOMP_INPUT_REPLAY");
     const bool input_record_requested = input_record_env && input_record_env[0];
     const bool input_replay_requested = input_replay_env && input_replay_env[0];
+    const char* input_replay_exclusive_env =
+        std::getenv("GBARECOMP_INPUT_REPLAY_EXCLUSIVE");
+    const bool input_replay_exclusive =
+        input_replay_requested && input_replay_exclusive_env &&
+        input_replay_exclusive_env[0] == '1';
     if (input_record_requested && input_replay_requested) {
         std::fprintf(stderr,
                      "[gbarecomp:runtime] GBARECOMP_INPUT_RECORD and "
@@ -2879,8 +2909,15 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
 
     auto pump_host_input = [&]() {
         if (!args.window) return;
-        capture_rewind_point();
+        if (!input_replay_exclusive) capture_rewind_point();
         auto ev = win.pump();
+        if (input_replay_exclusive) {
+            // Deterministic capture runs still drain the window-system queue,
+            // but connected controllers, keyboard hotkeys, and mouse/gyro
+            // input must not perturb a recorded guest-input route. Framedump
+            // count remains the run's termination condition.
+            ev = HostWindow::Events{};
+        }
         ++assist_script_pump;
         while (assist_script_index < assist_script_events.size() &&
                assist_script_events[assist_script_index].pump <=
@@ -2965,7 +3002,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         }
         bool fast_forward_latched = false;
 #if defined(GBARECOMP_RUNTIME_UI)
-        fast_forward_latched = runtime_ui_context.fast_forward_latched;
+        fast_forward_latched = !input_replay_exclusive &&
+                               runtime_ui_context.fast_forward_latched;
         fast_forward_multiplier = std::clamp(
             runtime_ui_context.fast_forward_multiplier, 2, 10);
 #else
@@ -2997,14 +3035,16 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
 #if defined(GBARECOMP_RUNTIME_UI)
         // Fold a menu request into the hotkey path so save/load has exactly
         // one implementation regardless of how the player asked for it.
-        if (runtime_ui_context.pending_save_slot) {
+        if (!input_replay_exclusive &&
+            runtime_ui_context.pending_save_slot) {
             ev.save_slot = runtime_ui_context.pending_save_slot;
-            runtime_ui_context.pending_save_slot = 0;
         }
-        if (runtime_ui_context.pending_load_slot) {
+        if (!input_replay_exclusive &&
+            runtime_ui_context.pending_load_slot) {
             ev.load_slot = runtime_ui_context.pending_load_slot;
-            runtime_ui_context.pending_load_slot = 0;
         }
+        runtime_ui_context.pending_save_slot = 0;
+        runtime_ui_context.pending_load_slot = 0;
 #endif
         if (opts.expose_assist_tools && !assist_tools_enabled()) {
             ev.save_slot = 0;
@@ -3049,7 +3089,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         bool rewind_requested = ev.rewind;
 #if defined(GBARECOMP_RUNTIME_UI)
         rewind_requested = rewind_requested ||
-                           runtime_ui_context.pending_rewind;
+                           (!input_replay_exclusive &&
+                            runtime_ui_context.pending_rewind);
         runtime_ui_context.pending_rewind = false;
 #endif
         if (rewind_requested && assist_tools_enabled()) {
@@ -3509,6 +3550,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 if (present_frame) win.present(live_fb.data());
                 // Framedump (capture runs only) is attributed to present_us.
                 if (framedump_dir && frame >= framedump_start &&
+                    (frame - framedump_start) % framedump_step == 0 &&
                     framedump_written < framedump_max) {
                     char p[512];
                     std::snprintf(p, sizeof(p), "%s/f_%06llu.png", framedump_dir,

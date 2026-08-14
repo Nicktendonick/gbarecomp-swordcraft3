@@ -250,4 +250,9 @@ extern "C" int (*g_ws_obj_attr_x_provider)(int oam_index,
 // keeps the established expanded-viewport OBJ test.
 extern "C" int g_ws_obj_native_clip;
 
+// Debug-only compositor isolation used by deterministic capture/audit tools.
+// Bits 0..3 select BG0..BG3 and bit 4 selects OBJ. The faithful default keeps
+// every layer enabled; games and normal builds never need to touch this.
+extern "C" unsigned g_ppu_debug_layer_mask;
+
 }  // namespace gba

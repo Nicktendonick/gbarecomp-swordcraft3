@@ -192,6 +192,37 @@ void test_extended_view_geometry_and_clamp() {
     }
 }
 
+void test_debug_layer_mask_is_opt_in_and_resets_cleanly() {
+    Fixture f;
+    disable_all_objects(f);
+    // Opaque red BG0 tile at X=0.
+    store16(&f.io[0x08], 0x0180);
+    f.vram[0] = 1;
+    store16(&f.vram[0x800], 0);
+    store16(&f.pal[2], 0x001F);
+    // Opaque green OBJ at the same pixel, in front of BG0.
+    store16(&f.oam[0], 0x0000);
+    store16(&f.oam[2], 0x0000);
+    store16(&f.oam[4], 0x0000);
+    f.vram[0x10000] = 0x02;
+    store16(&f.pal[0x204], 0x03E0);
+
+    gba::g_ppu_debug_layer_mask = 0x01u;
+    f.ppu.render(f.rgb.data(), 0x1100, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(f.rgb.data(), 255, 0, 0, "BG-only debug isolation");
+
+    gba::g_ppu_debug_layer_mask = 0x10u;
+    f.ppu.render(f.rgb.data(), 0x1100, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(f.rgb.data(), 0, 255, 0, "OBJ-only debug isolation");
+
+    gba::g_ppu_debug_layer_mask = 0x1Fu;
+    f.ppu.render(f.rgb.data(), 0x1100, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(f.rgb.data(), 0, 255, 0, "debug isolation reset");
+}
+
 void test_extended_view_capability_policy() {
     using gbarecomp::resolve_view_geometry;
     constexpr uint32_t kEngineMax = gba::GbaPpu::kMaxRenderWidth;
@@ -1697,6 +1728,7 @@ int main() {
     test_alpha_native_domain_and_green_precision();
     test_brightness_native_domain_and_green_precision();
     test_extended_view_geometry_and_clamp();
+    test_debug_layer_mask_is_opt_in_and_resets_cleanly();
     test_extended_view_capability_policy();
     test_resize_driven_view_policy();
     test_extended_view_preserves_authentic_center();
