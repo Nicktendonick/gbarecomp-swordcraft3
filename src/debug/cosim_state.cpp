@@ -1,6 +1,7 @@
 // cosim_state.cpp — full guest-architectural-state canonical hash. See
-// COSIM_ORACLE.md and cosim_state.h. Active ONLY in the GBA_COSIM build; the whole
-// translation unit is empty otherwise, so it is safe in the shared source list.
+// COSIM_ORACLE.md and cosim_state.h. The architectural hash is always
+// available for opt-in release-build determinism traces; the checkpoint/oracle
+// engine that consumes it remains gated separately by GBA_COSIM.
 //
 // Principle: hash exactly the state a real GBA exposes to the running program plus
 // the device-timing quantities that determine WHEN a guest-visible bit flips —
@@ -11,8 +12,6 @@
 // page-hash). That is more robust (no dirty-tracking bugs) and cheap enough for an
 // oracle at coarse stride; incremental page-hash-on-write is a future perf item if
 // fine-stride drilling needs it.
-#ifdef GBA_COSIM
-
 #include "cosim_state.h"
 
 #include "gba_bus.h"
@@ -142,5 +141,3 @@ uint64_t state_hash(SubHashes* sub) {
 }
 
 }  // namespace gbarecomp::cosim
-
-#endif  // GBA_COSIM

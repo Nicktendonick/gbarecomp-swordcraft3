@@ -43,6 +43,7 @@
 #include "snapshot.h"
 #include "mod_state.h"
 #include "tcp_debug_server.h"
+#include "cosim_state.h"     // opt-in release-build guest-state traces
 #ifdef GBA_COSIM
 #include "cosim.h"           // cosim_init() — first-divergence oracle TCP server
 #endif
@@ -1845,6 +1846,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // the run loop stops stepping the guest but keeps pumping input and
     // re-presenting the last frame.
     bool host_paused = false;
+    bool debugger_step_requested = false;
 
     auto pump_idle = [&](uint32_t max_cycles) -> uint32_t {
         uint32_t chunk = ppu.cycles_until_next_event();
@@ -2263,6 +2265,110 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
 
     HostWindow win;
     std::vector<uint8_t> live_fb;
+    // Optional delivered-PCM evidence stream. This captures the signed
+    // interleaved S16 samples after guest/mod mixing but before SDL buffering,
+    // so reference-audio tools can compare content without device jitter.
+    std::FILE* audio_dump = nullptr;
+    if (const char* path = std::getenv("GBARECOMP_AUDIO_DUMP")) {
+        if (*path) {
+            audio_dump = std::fopen(path, "wb");
+            if (!audio_dump)
+                std::fprintf(stderr,
+                    "[gbarecomp:runtime] could not open audio dump: %s\n", path);
+        }
+    }
+    std::FILE* state_trace = nullptr;
+    if (const char* path = std::getenv("GBARECOMP_STATE_TRACE")) {
+        if (*path) {
+            state_trace = std::fopen(path, "w");
+            if (!state_trace)
+                std::fprintf(stderr,
+                    "[gbarecomp:runtime] could not open state trace: %s\n", path);
+        }
+    }
+    auto trace_state = [&](std::uint64_t frame) {
+        if (!state_trace) return;
+        gbarecomp::cosim::SubHashes sub{};
+        const std::uint64_t hash = gbarecomp::cosim::state_hash(&sub);
+        std::fprintf(state_trace,
+            "{\"schema\":\"gbarecomp-state-trace-v1\",\"frame\":%llu,"
+            "\"hash\":\"%016llx\",\"cpu\":\"%016llx\","
+            "\"iwram\":\"%016llx\",\"ewram\":\"%016llx\","
+            "\"vram\":\"%016llx\",\"pal\":\"%016llx\","
+            "\"oam\":\"%016llx\",\"io\":\"%016llx\","
+            "\"audio\":\"%016llx\",\"ppu\":\"%016llx\","
+            "\"save\":\"%016llx\",\"clock\":\"%016llx\"}\n",
+            static_cast<unsigned long long>(frame),
+            static_cast<unsigned long long>(hash),
+            static_cast<unsigned long long>(sub.cpu),
+            static_cast<unsigned long long>(sub.iwram),
+            static_cast<unsigned long long>(sub.ewram),
+            static_cast<unsigned long long>(sub.vram),
+            static_cast<unsigned long long>(sub.pal),
+            static_cast<unsigned long long>(sub.oam),
+            static_cast<unsigned long long>(sub.io),
+            static_cast<unsigned long long>(sub.audio),
+            static_cast<unsigned long long>(sub.ppu),
+            static_cast<unsigned long long>(sub.save),
+            static_cast<unsigned long long>(sub.clock));
+    };
+    const char* visible_debugger_env =
+        std::getenv("GBARECOMP_VISIBLE_DEBUGGER");
+    const bool visible_debugger = visible_debugger_env &&
+        visible_debugger_env[0] && visible_debugger_env[0] != '0';
+    auto export_debugger_evidence = [&]() {
+        if (!visible_debugger || live_fb.empty()) return;
+        const char* root_env = std::getenv("GBARECOMP_DEBUG_CAPTURE_DIR");
+        const std::filesystem::path root = root_env && *root_env
+            ? std::filesystem::path(root_env)
+            : std::filesystem::path("debug-captures");
+        const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        char name[96];
+        std::snprintf(name, sizeof(name), "frame-%010llu-%lld",
+            static_cast<unsigned long long>(ppu.frame_count()),
+            static_cast<long long>(stamp));
+        const std::filesystem::path directory = root / name;
+        std::error_code fs_error;
+        std::filesystem::create_directories(directory, fs_error);
+        if (fs_error) {
+            std::fprintf(stderr, "debugger: cannot create %s: %s\n",
+                directory.string().c_str(), fs_error.message().c_str());
+            return;
+        }
+        const auto frame_path = directory / "frame.png";
+        const auto state_path = directory / "state.gbas";
+        const auto report_path = directory / "report.json";
+        std::string state_error;
+        const bool frame_ok = write_png(frame_path.string(), live_fb.data(),
+                                        ppu.render_width(), ppu.render_height());
+        const bool state_ok = do_savestate_save(state_path.string(), state_error);
+        gbarecomp::cosim::SubHashes sub{};
+        const std::uint64_t state_hash = gbarecomp::cosim::state_hash(&sub);
+        std::ofstream report(report_path, std::ios::binary | std::ios::trunc);
+        report << "{\n  \"schema\": \"gbarecomp-visible-debugger-v1\",\n"
+               << "  \"frame\": " << ppu.frame_count() << ",\n"
+               << "  \"pc\": \"0x" << std::hex << std::uppercase
+               << (g_cpu.R[15] & ~1u) << std::dec << "\",\n"
+               << "  \"view_width\": " << ppu.render_width() << ",\n"
+               << "  \"layer_mask\": " << gba::g_ppu_debug_layer_mask << ",\n"
+               << "  \"guest_state_fnv64\": \"" << std::hex
+               << state_hash << std::dec << "\",\n"
+               << "  \"frame_saved\": " << (frame_ok ? "true" : "false") << ",\n"
+               << "  \"state_saved\": " << (state_ok ? "true" : "false") << "\n}\n";
+        if (ws_provenance_armed())
+            ws_provenance_dump((directory / "widescreen-provenance.txt")
+                                   .string().c_str(),
+                               static_cast<int>((ppu.render_width() - 240u) / 2u));
+        std::fprintf(frame_ok && state_ok ? stdout : stderr,
+            "debugger: evidence %s %s%s%s%s\n",
+            frame_ok && state_ok ? "exported to" : "incomplete in",
+            directory.string().c_str(),
+            state_ok ? "" : " state_error=\"",
+            state_ok ? "" : state_error.c_str(),
+            state_ok ? "" : "\"");
+        std::fflush(frame_ok && state_ok ? stdout : stderr);
+    };
     // MC-WS-002 capture: per-present dump of the exact composed bytes handed to
     // SDL (`live_fb`). Gated by GBARECOMP_FRAMEDUMP_DIR; START = first guest
     // frame to capture, COUNT = how many; quits after COUNT are written. This
@@ -2478,6 +2584,11 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         if (args.fullscreen) win.set_fullscreen(args.fullscreen);
         win.set_volume(args.volume);
         win.set_fps_readout(opts.show_fps_by_default);
+        if (visible_debugger) {
+            std::printf("Visible debugger: F2 composite, F3-F6 BG0-BG3, "
+                        "F7 OBJ, F8 pause, F9 exact-step, F10 export.\n");
+            std::fflush(stdout);
+        }
 #if defined(GBARECOMP_RUNTIME_UI)
         runtime_ui_context.window = &win;
         runtime_ui_context.gyro_sensitivity = &args.gyro_sensitivity;
@@ -3018,6 +3129,21 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
 #endif
         fast_forward_active = assist_tools_enabled() &&
                               (ev.fast_forward || fast_forward_latched);
+        if (visible_debugger && ev.debug_layer_mask >= 0) {
+            gba::g_ppu_debug_layer_mask =
+                static_cast<unsigned>(ev.debug_layer_mask) & 0x1fu;
+            ppu.render(live_fb.data(), bus.io().read16(0x000), bus.io().raw(),
+                       bus.vram_ptr(), bus.oam_ptr(), bus.pal_ptr());
+            win.present(live_fb.data());
+            std::printf("debugger: layer_mask=0x%02X\n",
+                        gba::g_ppu_debug_layer_mask);
+        }
+        if (visible_debugger && ev.debug_step_frame) {
+            host_paused = true;
+            debugger_step_requested = true;
+        }
+        if (visible_debugger && ev.debug_export)
+            export_debugger_evidence();
         // System hotkeys (config.ini [KeyMap], rebindable in the launcher).
         if (ev.toggle_fullscreen) {
             // Toggle between windowed and the configured mode. A session
@@ -3166,6 +3292,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         runtime_set_frame_present_hook([&]() -> bool {
             uint64_t frame = ppu.frame_count();
             if (frame != last_presented_frame) {
+                trace_state(frame);
                 const uint64_t fp_t0 = FramePhaseRing::now_ns();
                 const bool present_frame = !fast_forward_active ||
                     (frame % static_cast<uint64_t>(
@@ -3188,6 +3315,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 std::size_t n = bus.audio().drain_samples(audio_buf, 2048);
                 if (n > 0 && !fast_forward_active) {
                     gba_mod_audio_mix(audio_buf, n);
+                    if (audio_dump)
+                        std::fwrite(audio_buf, sizeof(audio_buf[0]), n,
+                                    audio_dump);
                     win.push_audio_samples(audio_buf, n);
                 }
                 const uint64_t fp_t3 = FramePhaseRing::now_ns();
@@ -3472,13 +3602,15 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     for (uint64_t i = 0; i < step_budget && !host_quit; ++i) {
         // Paused: hold the guest still, keep the window alive (input pump,
         // re-present, ~100 Hz idle). Applies to windowed play only.
-        while (host_paused && !host_quit && args.window) {
+        while (host_paused && !debugger_step_requested &&
+               !host_quit && args.window) {
             pump_host_input();
             win.present(live_fb.data());
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         if (host_quit) break;
         if (!step_once()) break;
+        debugger_step_requested = false;
         if (input_replay_requested) {
             apply_input_replay();
         } else if (demo_input) {
@@ -3537,6 +3669,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             }
             uint64_t frame = ppu.frame_count();
             if (frame != last_presented_frame) {
+                trace_state(frame);
                 const uint64_t fp_t0 = FramePhaseRing::now_ns();
                 const bool present_frame = !fast_forward_active ||
                     (frame % static_cast<uint64_t>(
@@ -3570,6 +3703,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 std::size_t n = bus.audio().drain_samples(audio_buf, 2048);
                 if (n > 0 && !fast_forward_active) {
                     gba_mod_audio_mix(audio_buf, n);
+                    if (audio_dump)
+                        std::fwrite(audio_buf, sizeof(audio_buf[0]), n,
+                                    audio_dump);
                     win.push_audio_samples(audio_buf, n);
                 }
                 const uint64_t fp_t3 = FramePhaseRing::now_ns();
@@ -3627,6 +3763,14 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     runtime_set_frame_present_hook(nullptr);
     runtime_set_host_service_hook(nullptr);
     runtime_set_frame_start_hook(nullptr);
+    if (audio_dump) {
+        std::fclose(audio_dump);
+        audio_dump = nullptr;
+    }
+    if (state_trace) {
+        std::fclose(state_trace);
+        state_trace = nullptr;
+    }
     frame_phase.dump();  // HP-002: flush the phase ring (env-gated CSV)
     // HP-002: flush the always-on MMIO write ring (gba_io.cpp) to CSV.
     // GBARECOMP_MMIO_DUMP=<path>. Offline analysis derives the scanline of

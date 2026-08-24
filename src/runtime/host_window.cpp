@@ -1957,8 +1957,20 @@ HostWindow::Events HostWindow::pump() {
             // keycodes are contiguous, so slot = sym - F1 + 1.
             SDL_Keycode sym = e.key.keysym.sym;
             Uint16 mods = e.key.keysym.mod;
+            const char* debugger_env = std::getenv("GBARECOMP_VISIBLE_DEBUGGER");
+            const bool visible_debugger = debugger_env && debugger_env[0] &&
+                                          debugger_env[0] != '0';
             if (sym == SDLK_ESCAPE) {
                 ev.quit = true;
+            } else if (visible_debugger && sym >= SDLK_F2 && sym <= SDLK_F7) {
+                static const int masks[] = {0x1f, 0x01, 0x02, 0x04, 0x08, 0x10};
+                ev.debug_layer_mask = masks[sym - SDLK_F2];
+            } else if (visible_debugger && sym == SDLK_F8) {
+                ev.toggle_pause = true;
+            } else if (visible_debugger && sym == SDLK_F9) {
+                ev.debug_step_frame = true;
+            } else if (visible_debugger && sym == SDLK_F10) {
+                ev.debug_export = true;
             } else if (sym >= SDLK_F1 && sym <= SDLK_F9) {
                 int slot = static_cast<int>(sym - SDLK_F1) + 1;
                 if (mods & KMOD_SHIFT) ev.save_slot = slot;

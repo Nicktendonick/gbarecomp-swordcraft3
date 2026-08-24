@@ -40,7 +40,9 @@
 #include "arm_ir.h"
 
 #include "../gba/gba_bus.h"
+#include "../gba/gba_ppu.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -55,6 +57,11 @@ namespace {
 struct MissRec {
     bool          thumb = false;
     std::uint64_t count = 0;
+    std::uint64_t first_frame = 0;
+    std::uint64_t last_frame = 0;
+    std::uint32_t return_pc = 0;
+    std::uint64_t first_code_hash = 0;
+    std::uint64_t last_code_hash = 0;
     // The top-level/empty-stack "fallback bridge" stderr line is emitted ONCE
     // per PC (like the dispatch-miss line); per-occurrence counts live in the
     // exit report. A hot interior-resume bridge (e.g. the WaitForVBlank poll
@@ -71,6 +78,42 @@ bool                             g_miss_notice_logged = false;
 bool self_heal_verbose() {
     const char* value = std::getenv("GBARECOMP_SELFHEAL_VERBOSE");
     return value && value[0] != '\0' && value[0] != '0';
+}
+
+const char* miss_region(std::uint32_t pc) {
+    if (pc < 0x00004000u) return "bios";
+    if (pc >= 0x02000000u && pc < 0x02040000u) return "ewram";
+    if (pc >= 0x03000000u && pc < 0x03008000u) return "iwram";
+    if (pc >= 0x08000000u && pc < 0x0e000000u) return "rom";
+    return "other";
+}
+
+std::uint64_t hash_miss_code(std::uint32_t pc) {
+    gba::GbaBus* bus = gbarecomp::active_bus();
+    if (!bus) return 0;
+    const std::uint8_t* bytes = nullptr;
+    std::size_t available = 0;
+    if (pc >= 0x02000000u && pc < 0x02040000u) {
+        bytes = bus->ewram_ptr() + (pc - 0x02000000u);
+        available = 0x02040000u - pc;
+    } else if (pc >= 0x03000000u && pc < 0x03008000u) {
+        bytes = bus->iwram_ptr() + (pc - 0x03000000u);
+        available = 0x03008000u - pc;
+    } else if (pc >= 0x08000000u && pc < 0x0e000000u && bus->rom_ptr()) {
+        const std::size_t offset = pc - 0x08000000u;
+        if (offset < bus->rom_size()) {
+            bytes = bus->rom_ptr() + offset;
+            available = bus->rom_size() - offset;
+        }
+    }
+    if (!bytes || available == 0) return 0;
+    const std::size_t length = std::min<std::size_t>(available, 64u);
+    std::uint64_t hash = UINT64_C(1469598103934665603);
+    for (std::size_t i = 0; i < length; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
 }
 
 // Program identity, set once at startup, stamped into the persisted miss/
@@ -92,6 +135,7 @@ namespace gbarecomp {
 void self_heal_reset() {
     g_misses.clear();
     g_interp_insns = 0;
+    g_miss_notice_logged = false;
 }
 
 void self_heal_set_program_identity(const char* title, const char* code,
@@ -261,7 +305,7 @@ std::string self_heal_misses_json() {
     const bool fully_static = g_misses.empty() && healed == 0;
 
     std::string out;
-    char buf[640];
+    char buf[1024];
     std::snprintf(buf, sizeof(buf),
         "{\"ok\":true,\"program\":\"%s\",\"code\":\"%s\",\"sha1\":\"%s\","
         "\"coverage\":\"%s\",\"enabled\":%s,"
@@ -287,9 +331,20 @@ std::string self_heal_misses_json() {
             gbarecomp::overlay_query(kv.first, kv.second.thumb, &ncalls);
         std::snprintf(buf, sizeof(buf),
             "%s{\"pc\":\"0x%08X\",\"mode\":\"%s\",\"bridged\":%llu,"
+            "\"region\":\"%s\",\"first_frame\":%llu,\"last_frame\":%llu,"
+            "\"return_pc\":\"0x%08X\","
+            "\"first_code_fnv64\":\"%016llx\","
+            "\"last_code_fnv64\":\"%016llx\",\"code_changed\":%s,"
             "\"healed\":%s,\"native_calls\":%llu,\"jump_table_candidate\":%s}",
             first ? "" : ",", kv.first, kv.second.thumb ? "thumb" : "arm",
             static_cast<unsigned long long>(kv.second.count),
+            miss_region(kv.first),
+            static_cast<unsigned long long>(kv.second.first_frame),
+            static_cast<unsigned long long>(kv.second.last_frame),
+            kv.second.return_pc,
+            static_cast<unsigned long long>(kv.second.first_code_hash),
+            static_cast<unsigned long long>(kv.second.last_code_hash),
+            kv.second.first_code_hash != kv.second.last_code_hash ? "true" : "false",
             is_healed ? "true" : "false",
             static_cast<unsigned long long>(ncalls),
             jt_pc[kv.first] ? "true" : "false");
@@ -329,7 +384,20 @@ namespace {
 void record_and_log_miss(std::uint32_t pc, bool thumb) {
     MissRec& r = g_misses[pc];
     bool first = (r.count == 0);
+    const auto* ppu = gbarecomp::active_ppu();
+    const std::uint64_t frame = ppu ? ppu->frame_count() : 0;
+    const std::uint64_t code_hash = hash_miss_code(pc);
+    const std::uint32_t depth = runtime_call_stack_depth();
+    const std::uint32_t return_pc = depth
+        ? runtime_call_stack_data()[depth - 1u] & ~1u : 0u;
     r.thumb = thumb;
+    if (first) {
+        r.first_frame = frame;
+        r.first_code_hash = code_hash;
+        r.return_pc = return_pc;
+    }
+    r.last_frame = frame;
+    r.last_code_hash = code_hash;
     ++r.count;
     if (first) {
         char symbuf[96];
