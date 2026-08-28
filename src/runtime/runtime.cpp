@@ -1137,6 +1137,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     gba::g_ws_pillarbox = 0;
     gba::g_ws_pillarbox_left = 0;
     gba::g_ws_pillarbox_right = 0;
+    gba::g_ws_obj_native_clip = 0;
+    gba::g_ws_margin_occlusion_layers = 0;
     g_runtime_fn_entry_hook = nullptr;
     g_runtime_thumb_alu_imm_override = nullptr;
     g_runtime_bus_read_override = nullptr;

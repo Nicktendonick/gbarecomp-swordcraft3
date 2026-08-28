@@ -249,6 +249,12 @@ extern "C" int (*g_ws_obj_attr_x_provider)(int oam_index,
 // providers above run first and may re-place known-safe sprites. Default 0
 // keeps the established expanded-viewport OBJ test.
 extern "C" int g_ws_obj_native_clip;
+// Opt-in expanded-view foreground mask. Selected regular/affine BG layers
+// define authored world coverage in the margins; wherever none emits an
+// opaque pixel, the final margin stays black above UI and OBJ. This lets a
+// game preserve finite room/transition boundaries while still widening
+// objects over genuinely drawn scenery. Zero (default) disables the policy.
+extern "C" unsigned g_ws_margin_occlusion_layers;
 // Optional game-owned final presentation pass for an expanded framebuffer.
 // It runs only after a complete wide frame has been latched, never on the
 // native renderer or serialized guest state. Games can use this for effects

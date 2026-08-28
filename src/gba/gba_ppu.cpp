@@ -46,6 +46,7 @@ extern "C" int (*g_ws_obj_attr_x_provider)(int, std::uint16_t,
 // still run first, so a game can re-place known-safe HUD sprites and clip the
 // rest.
 extern "C" int g_ws_obj_native_clip = 0;
+extern "C" unsigned g_ws_margin_occlusion_layers = 0;
 extern "C" void (*g_ws_frame_postprocess)(std::uint8_t*, std::uint32_t,
                                             std::uint32_t, std::uint32_t,
                                             std::uint32_t) = nullptr;
@@ -1437,6 +1438,7 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
 
     PixelCandidate top[GbaPpu::kMaxRenderWidth];
     PixelCandidate second[GbaPpu::kMaxRenderWidth];
+    bool margin_world_covered[GbaPpu::kMaxRenderWidth] = {};
     const uint16_t backdrop_color = load_u16_le(&pal[0]);
     uint8_t backdrop_rgb[3];
     to_rgb888(backdrop_color, backdrop_rgb);
@@ -1453,6 +1455,10 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
     }
     auto submit = [&](uint32_t x, uint16_t color, int key, uint8_t layer,
                       bool target1, bool target2) {
+        if (layer < 4u &&
+            (g_ws_margin_occlusion_layers & (1u << layer)) != 0) {
+            margin_world_covered[x] = true;
+        }
         PixelCandidate cand;
         cand.color = color;
         to_rgb888(color, cand.rgb);
@@ -1970,7 +1976,11 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
         // screens so menus/battles are letterboxed, not garbled.
         const bool left_margin = x < ox;
         const bool right_margin = x >= ox + 240u;
-        if ((black_nonuniform_window_margins &&
+        const bool margin_occlusion_active =
+            (g_ppu_debug_layer_mask & g_ws_margin_occlusion_layers) != 0;
+        if ((margin_occlusion_active && (left_margin || right_margin) &&
+             !margin_world_covered[x]) ||
+            (black_nonuniform_window_margins &&
              (left_margin || right_margin)) ||
             (!palette_backdrop_only &&
              ((g_ws_pillarbox && (left_margin || right_margin)) ||

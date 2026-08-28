@@ -659,6 +659,80 @@ void test_extended_view_obj_native_clip_is_opt_in() {
     gba::g_ws_obj_native_clip = 0;
 }
 
+void test_margin_world_coverage_can_occlude_objects() {
+    Fixture f;
+    disable_all_objects(f);
+    f.ppu.set_view_margins(24, 24, 0, 0);
+
+    // BG1's wrapped tile column 29 supplies the leftmost wide-margin sample.
+    // Pixel 0 is transparent (a deliberate room boundary); pixel 1 is opaque
+    // green world art. A red OBJ spans both pixels from hardware X=-24.
+    store16(&f.io[0x0A], 0x0180);  // BG1 256-color, screen block 1.
+    store16(&f.vram[0x800 + 29u * 2u], 0);
+    f.vram[0] = 0;
+    f.vram[1] = 1;
+    store16(&f.pal[2], 0x03E0);
+    std::fill_n(f.vram.begin() + 0x10000, 32,
+                static_cast<uint8_t>(0x22));
+    store16(&f.pal[0x204], 0x001F);
+    store16(&f.oam[0], 0x0000);
+    store16(&f.oam[2], 0x01E8);  // Signed hardware X=-24 -> output X=0.
+    store16(&f.oam[4], 0x0000);
+
+    std::vector<uint8_t> wide(gba::GbaPpu::kMaxFramebufferBytes, 0);
+    gba::g_ws_margin_occlusion_layers = 0;
+    gba::g_ppu_debug_layer_mask = 0x1Fu;
+    f.ppu.render(wide.data(), 0x1200, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(wide.data(), 255, 0, 0,
+                 "inactive margin occlusion altered OBJ");
+
+    gba::g_ws_margin_occlusion_layers = 0x02u;
+    f.ppu.render(wide.data(), 0x1200, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(wide.data(), 0, 0, 0,
+                 "uncovered world margin failed to occlude OBJ");
+    expect_pixel(wide.data() + 3u, 255, 0, 0,
+                 "covered world margin incorrectly occluded OBJ");
+
+    // A screen-space BG0 (for example a portrait) does not count as world
+    // coverage. It stays behind the same boundary but remains visible beside
+    // an opaque BG1 world pixel.
+    store16(&f.io[0x08], 0x0284);  // BG0 char block 1, screen block 2.
+    store16(&f.vram[0x1000 + 29u * 2u], 0);
+    std::fill_n(f.vram.begin() + 0x4000, 64, static_cast<uint8_t>(2));
+    store16(&f.pal[4], 0x7C00);
+    disable_all_objects(f);
+    f.ppu.render(wide.data(), 0x0300, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(wide.data(), 0, 0, 0,
+                 "uncovered world margin failed to occlude UI BG");
+    expect_pixel(wide.data() + 3u, 0, 0, 255,
+                 "covered world margin incorrectly occluded UI BG");
+
+    store16(&f.oam[0], 0x0000);
+    store16(&f.oam[2], 0x01E8);
+    store16(&f.oam[4], 0x0000);
+
+    // OBJ-only diagnostics remain raw even while the composite policy is
+    // armed, so capture tools can still prove that widened OAM was authored.
+    gba::g_ppu_debug_layer_mask = 0x10u;
+    f.ppu.render(wide.data(), 0x1200, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(wide.data(), 255, 0, 0,
+                 "margin occlusion changed OBJ-only diagnostics");
+
+    f.ppu.set_view_margins(0, 0, 0, 0);
+    store16(&f.oam[2], 0x0000);
+    f.ppu.render(f.rgb.data(), 0x1200, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(f.rgb.data(), 255, 0, 0,
+                 "margin occlusion changed native rendering");
+
+    gba::g_ppu_debug_layer_mask = 0x1Fu;
+    gba::g_ws_margin_occlusion_layers = 0;
+}
+
 void test_extended_view_extends_nearest_window_edge() {
     Fixture f;
     store16(&f.io[0x08], 0x0180);  // BG0 256-color, screen block 1.
@@ -1781,6 +1855,7 @@ int main() {
     test_extended_view_obj_x_is_explicitly_opt_in();
     test_extended_view_obj_attr_x_is_explicitly_opt_in();
     test_extended_view_obj_native_clip_is_opt_in();
+    test_margin_world_coverage_can_occlude_objects();
     test_extended_view_extends_nearest_window_edge();
     test_bitmap_mode3_direct_color_and_affine_origin();
     test_bitmap_mode4_palette_transparency_and_page_flip();
