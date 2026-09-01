@@ -27,11 +27,13 @@ struct ExtendedViewFrameInfo {
     // can resolve its original, full map data here without mutating the guest
     // or teaching the shared renderer about cartridge-specific structures.
     // Guest addresses retain their normal GBA bases (EWRAM 0x02000000,
-    // IWRAM 0x03000000, ROM 0x08000000).
+    // IWRAM 0x03000000, VRAM 0x06000000, ROM 0x08000000).
     const std::uint8_t* ewram = nullptr;
     std::size_t ewram_size = 0;
     const std::uint8_t* iwram = nullptr;
     std::size_t iwram_size = 0;
+    const std::uint8_t* vram = nullptr;
+    std::size_t vram_size = 0;
     const std::uint8_t* rom = nullptr;
     std::size_t rom_size = 0;
 };

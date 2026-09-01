@@ -840,6 +840,7 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
         "Rewind returns to a recent point kept in memory. Fast-forward runs "
         "without the normal frame limiter. Keyboard and controller controls "
         "can be changed below.";
+    gi.settings_bindings = opts.expose_assist_tools ? 1 : 0;
     gi.assist_binding_labels = kAssistBindings;
     gi.assist_binding_count = opts.expose_assist_tools ? 2 : 0;
     gi.assist_default_key_bind = kAssistDefaultKeys;

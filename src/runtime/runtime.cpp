@@ -2477,6 +2477,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         info.ewram_size = 256u * 1024u;
         info.iwram = bus.iwram_ptr();
         info.iwram_size = 32u * 1024u;
+        info.vram = bus.vram_ptr();
+        info.vram_size = 96u * 1024u;
         info.rom = bus.rom_ptr();
         info.rom_size = bus.rom_size();
         opts.extended_view_frame(&info);
