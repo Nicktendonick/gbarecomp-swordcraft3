@@ -92,6 +92,20 @@ int test_affine_filter(int bg, int) {
 }
 
 int g_bg_x_provider_calls = 0;
+int g_frame_postprocess_calls = 0;
+
+void test_frame_postprocess(uint8_t* rgb, uint32_t width, uint32_t height,
+                            uint32_t extra_left, uint32_t extra_right) {
+    ++g_frame_postprocess_calls;
+    if (!rgb || width != 288 || height != 160 ||
+        extra_left != 24 || extra_right != 24) {
+        std::fprintf(stderr, "frame postprocess: unexpected geometry\n");
+        std::exit(1);
+    }
+    rgb[0] = 0x12;
+    rgb[1] = 0x34;
+    rgb[2] = 0x56;
+}
 
 int test_bg_x_provider(int bg, int output_x, int, int* out_hw_x) {
     ++g_bg_x_provider_calls;
@@ -176,6 +190,37 @@ void test_extended_view_geometry_and_clamp() {
         std::fprintf(stderr, "extended-view clamp mismatch\n");
         std::exit(1);
     }
+}
+
+void test_debug_layer_mask_is_opt_in_and_resets_cleanly() {
+    Fixture f;
+    disable_all_objects(f);
+    // Opaque red BG0 tile at X=0.
+    store16(&f.io[0x08], 0x0180);
+    f.vram[0] = 1;
+    store16(&f.vram[0x800], 0);
+    store16(&f.pal[2], 0x001F);
+    // Opaque green OBJ at the same pixel, in front of BG0.
+    store16(&f.oam[0], 0x0000);
+    store16(&f.oam[2], 0x0000);
+    store16(&f.oam[4], 0x0000);
+    f.vram[0x10000] = 0x02;
+    store16(&f.pal[0x204], 0x03E0);
+
+    gba::g_ppu_debug_layer_mask = 0x01u;
+    f.ppu.render(f.rgb.data(), 0x1100, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(f.rgb.data(), 255, 0, 0, "BG-only debug isolation");
+
+    gba::g_ppu_debug_layer_mask = 0x10u;
+    f.ppu.render(f.rgb.data(), 0x1100, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(f.rgb.data(), 0, 255, 0, "OBJ-only debug isolation");
+
+    gba::g_ppu_debug_layer_mask = 0x1Fu;
+    f.ppu.render(f.rgb.data(), 0x1100, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(f.rgb.data(), 0, 255, 0, "debug isolation reset");
 }
 
 void test_extended_view_capability_policy() {
@@ -553,6 +598,51 @@ void test_extended_view_obj_attr_x_is_explicitly_opt_in() {
     expect_pixel(wide.data() + (24u + 260u) * 3u, 255, 0, 0,
                  "attribute-aware HUD OBJ placement");
     gba::g_ws_obj_attr_x_provider = nullptr;
+}
+
+void test_extended_view_obj_native_clip_is_opt_in() {
+    Fixture f;
+    disable_all_objects(f);
+    // OBJ 0: parked just off the native left edge (signed 9-bit X = -4), the
+    // idiom games use to hide sprites. Vanilla wide draws its colored texels
+    // in the left margin; the opt-in clip must not.
+    store16(&f.oam[0], 0x0000);
+    store16(&f.oam[2], 0x01FC);
+    store16(&f.oam[4], 0x0000);
+    // OBJ 1: fully inside the native viewport at X=8; must be unaffected.
+    store16(&f.oam[8], 0x0000);
+    store16(&f.oam[10], 8);
+    store16(&f.oam[12], 0x0000);
+    f.vram[0x10000] = 0x11;          // Tile 0: first two texels use color 1.
+    store16(&f.pal[0x202], 0x001F);  // OBJ color 1 = red.
+
+    f.ppu.set_view_margins(24, 24, 0, 0);
+    std::vector<uint8_t> wide(gba::GbaPpu::kMaxFramebufferBytes, 0);
+    f.ppu.render(wide.data(), 0x1000, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(wide.data() + (24u - 4u) * 3u, 255, 0, 0,
+                 "vanilla wide margin OBJ");
+    expect_pixel(wide.data() + (24u + 8u) * 3u, 255, 0, 0,
+                 "vanilla wide center OBJ");
+
+    gba::g_ws_obj_native_clip = 1;
+    std::fill(wide.begin(), wide.end(), 0);
+    f.ppu.render(wide.data(), 0x1000, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(wide.data() + (24u - 4u) * 3u, 0, 0, 0,
+                 "clipped margin OBJ leaked into margin");
+    expect_pixel(wide.data() + (24u + 8u) * 3u, 255, 0, 0,
+                 "clip altered native-viewport OBJ");
+    gba::g_ws_obj_native_clip = 0;
+
+    // The faithful native renderer must be inert to the flag.
+    gba::g_ws_obj_native_clip = 1;
+    f.ppu.set_view_margins(0, 0, 0, 0);
+    f.ppu.render(f.rgb.data(), 0x1000, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(f.rgb.data() + 8u * 3u, 255, 0, 0,
+                 "native render changed by OBJ clip flag");
+    gba::g_ws_obj_native_clip = 0;
 }
 
 void test_extended_view_extends_nearest_window_edge() {
@@ -952,12 +1042,42 @@ void test_latched_frame_immune_to_in_progress_scanlines() {
                  "latch immunity: frame B backdrop");
 }
 
+void test_frame_postprocess_is_wide_only_and_opt_in() {
+    gba::g_ws_frame_postprocess = test_frame_postprocess;
+    g_frame_postprocess_calls = 0;
+
+    gba::GbaPpu native;
+    native.mark_framebuffer_latched();
+    if (g_frame_postprocess_calls != 0) {
+        std::fprintf(stderr, "frame postprocess: native latch called hook\n");
+        std::exit(1);
+    }
+
+    gba::GbaPpu wide;
+    wide.set_view_margins(24, 24, 0, 0);
+    wide.mark_framebuffer_latched();
+    if (g_frame_postprocess_calls != 1) {
+        std::fprintf(stderr, "frame postprocess: wide latch missed hook\n");
+        std::exit(1);
+    }
+    expect_pixel(wide.latched_framebuffer(), 0x12, 0x34, 0x56,
+                 "frame postprocess: margin marker");
+
+    gba::g_ws_frame_postprocess = nullptr;
+    wide.mark_framebuffer_latched();
+    if (g_frame_postprocess_calls != 1) {
+        std::fprintf(stderr, "frame postprocess: null hook was called\n");
+        std::exit(1);
+    }
+}
+
 } // namespace
 
 int main() {
     test_alpha_native_domain_and_green_precision();
     test_brightness_native_domain_and_green_precision();
     test_extended_view_geometry_and_clamp();
+    test_debug_layer_mask_is_opt_in_and_resets_cleanly();
     test_extended_view_capability_policy();
     test_resize_driven_view_policy();
     test_extended_view_preserves_authentic_center();
@@ -966,6 +1086,7 @@ int main() {
     test_obj_only_palette_backdrop_is_not_policy_black();
     test_extended_view_obj_x_is_explicitly_opt_in();
     test_extended_view_obj_attr_x_is_explicitly_opt_in();
+    test_extended_view_obj_native_clip_is_opt_in();
     test_extended_view_extends_nearest_window_edge();
     test_bitmap_mode3_direct_color_and_affine_origin();
     test_bitmap_mode4_palette_transparency_and_page_flip();
@@ -975,6 +1096,7 @@ int main() {
     test_affine_reference_reload_overrides_scanline_accumulation();
     test_wide_affine_filter_is_selective_and_bilinear();
     test_latched_frame_immune_to_in_progress_scanlines();
+    test_frame_postprocess_is_wide_only_and_opt_in();
     std::puts("ppu_smoke_tests: PASS");
     return 0;
 }

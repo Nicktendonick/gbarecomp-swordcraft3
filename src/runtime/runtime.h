@@ -12,6 +12,30 @@
 
 namespace gbarecomp {
 
+// Read-only state published to an opted-in game's extended-view policy once
+// per emulated frame. The shared runtime owns the wider surface; the game owns
+// the decision about whether the current scene has authentic margin content.
+// Keeping this view deliberately small avoids exposing mutable bus internals.
+struct ExtendedViewFrameInfo {
+    std::uint64_t frame_count = 0;
+    std::uint32_t view_width = 240;
+    std::uint32_t extra_left = 0;
+    std::uint32_t extra_right = 0;
+    const std::uint8_t* io = nullptr;
+    std::size_t io_size = 0;
+    // Read-only guest address spaces for game-owned margin providers. A game
+    // can resolve its original, full map data here without mutating the guest
+    // or teaching the shared renderer about cartridge-specific structures.
+    // Guest addresses retain their normal GBA bases (EWRAM 0x02000000,
+    // IWRAM 0x03000000, ROM 0x08000000).
+    const std::uint8_t* ewram = nullptr;
+    std::size_t ewram_size = 0;
+    const std::uint8_t* iwram = nullptr;
+    std::size_t iwram_size = 0;
+    const std::uint8_t* rom = nullptr;
+    std::size_t rom_size = 0;
+};
+
 // Per-game built-in defaults baked into a game runner at compile time.
 // Lets a standalone release .exe (e.g. MinishCapRecomp.exe) ship
 // without a sibling game.toml — the runtime falls back to these
@@ -48,6 +72,26 @@ struct RunOptions {
     std::uint16_t max_resize_view_width = 240;
     bool resize_driven_view = false;
 
+    // Host-window presentation policy, independent of extended guest view.
+    // When true the player may freely reshape a window while SDL keeps the
+    // native game image aspect-correct with letter/pillar boxing.
+    bool freely_resizable_window = false;
+
+    // Player-facing diagnostics. The counter reports actual presents per
+    // second in the native window title; games may ship it enabled while
+    // retaining the shared hotkey/menu toggle.
+    bool show_fps_by_default = false;
+
+    // Optional shared Assist Tools surface. Games opt into the menu and choose
+    // its resource bounds; the implementation remains engine-owned and
+    // reusable. Slot hotkeys continue to cover 1-9, while menus can reach 10.
+    bool expose_assist_tools = false;
+    bool assist_tools_enabled_by_default = true;
+    std::uint8_t assist_fast_forward_multiplier_default = 4;
+    std::uint8_t save_state_slot_count = 9;
+    std::uint8_t rewind_history_seconds = 0;
+    std::uint8_t rewind_capture_interval_frames = 15;
+
     // Optional game-owned content initializer. Called exactly once, after the
     // first non-native view has been authorized and applied. For a fixed view
     // that is during startup; for resize-driven view it is deferred until the
@@ -55,6 +99,13 @@ struct RunOptions {
     // the generated function-entry fast path too.
     void (*extended_view_init)(std::uint32_t extra_left,
                                std::uint32_t extra_right) = nullptr;
+
+    // Optional game-owned per-frame margin policy. It runs at the start of an
+    // emulated frame, before scanline 0 is composed, and again immediately
+    // after a live adaptive resize. Games may use the read-only PPU registers
+    // above to select shared margin providers/pillarboxing. Null leaves the
+    // established renderer behavior unchanged.
+    void (*extended_view_frame)(const ExtendedViewFrameInfo* frame) = nullptr;
 
     // This cartridge carries a solar sensor. Unlike the RTC there is no ROM
     // signature to detect one from, so it has to be declared. Games that leave
@@ -138,6 +189,17 @@ struct RunOptions {
     const char* launcher_save_path = nullptr;   // explicit save file (game.toml
                                                 // [save].path); null => <rom>.sav
                                                 // derived from the seeded ROM
+    // Opt into recomp-ui's verified IPS/IPS32/BPS source-ROM patch surface.
+    // Patched images are generated under the executable's mods/rom-patches
+    // cache; the original ROM and patch file are never modified.
+    bool launcher_enable_rom_patches = false;
+    const char* launcher_rom_patch_note = nullptr;
+    // Translation-specific builds can verify a stock source independently
+    // from builtin_rom_sha1 (the target image the generated corpus expects).
+    const char* launcher_source_rom_sha1 = nullptr;
+    // Lowercase SHA-1 of the only accepted patched output for a corpus built
+    // against one translation release. Null leaves data-only patches open.
+    const char* launcher_required_patch_sha1 = nullptr;
     // Keep an implemented extended-view mode out of the public launcher while
     // it is still being profiled. Explicit CLI/TOML opt-ins remain available.
     // Defaults true so existing games (including MMZ) retain today's UI.

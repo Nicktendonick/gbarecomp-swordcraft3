@@ -63,6 +63,10 @@ extern "C" unsigned long long g_prof_scanline_count = 0;
 // guest input. It keeps a window responsive while one emulated frame spends a
 // long time in translated software-rendering or decode code.
 std::function<void()> g_host_service_hook;
+// Optional game-owned extended-view policy. It runs on the emulation thread at
+// the exact frame boundary, before scanline 0 of the next frame is composed.
+// Null preserves the established renderer path for every existing game.
+std::function<void()> g_frame_start_hook;
 static const bool g_phase_prof = [] {
     const char* e = std::getenv("GBARECOMP_PHASE_PROF");
     bool on = (e != nullptr) && !(e[0] == '0' && e[1] == '\0');
@@ -554,6 +558,9 @@ static void tick_devices(gba::GbaBus* bus, gba::GbaPpu* ppu, uint32_t cycles) {
             ++g_runtime_vblank_starts;
             bus->io().run_timed_dma(1);   // VBlank-timed DMA
         }
+        if (events.frame_completed && g_frame_start_hook) {
+            g_frame_start_hook();
+        }
         if (events.vblank_started && (ds & 0x0008u)) {
             bus->io().request_irq(gba::GbaIo::IrqVBlank);
         }
@@ -892,6 +899,27 @@ std::function<bool()> g_frame_present_hook;
 // runner — one return only frees one frame. Cleared when a hook is (re)set.
 bool g_frame_present_quit = false;
 
+// Present-in-place deliberately preserves the generated host call chain across
+// frames, but some guest script engines keep a call active for thousands of
+// frames. Periodically unwind at a completed VBlank before the fixed generated
+// call-return stack reaches its hard limit. The runner immediately redispatches
+// the already-published PC, so guest execution is unchanged.
+constexpr uint32_t kPresentInPlaceCallDepthLimit = 512u;
+
+uint32_t present_in_place_call_depth_limit() {
+    static const uint32_t limit = [] {
+        const char* value = std::getenv(
+            "GBARECOMP_PRESENT_IN_PLACE_CALL_DEPTH");
+        if (!value || value[0] == '\0')
+            return kPresentInPlaceCallDepthLimit;
+        const unsigned long parsed = std::strtoul(value, nullptr, 0);
+        return parsed > 0u && parsed < 1024u
+            ? static_cast<uint32_t>(parsed)
+            : kPresentInPlaceCallDepthLimit;
+    }();
+    return limit;
+}
+
 void runtime_set_frame_present_hook(std::function<bool()> h) {
     g_frame_present_hook = std::move(h);
     g_frame_present_quit = false;
@@ -899,6 +927,10 @@ void runtime_set_frame_present_hook(std::function<bool()> h) {
 
 void runtime_set_host_service_hook(std::function<void()> h) {
     g_host_service_hook = std::move(h);
+}
+
+void runtime_set_frame_start_hook(std::function<void()> h) {
+    g_frame_start_hook = std::move(h);
 }
 
 extern "C" bool runtime_should_yield(void) {
@@ -961,8 +993,28 @@ extern "C" bool runtime_should_yield(void) {
             // quit. With no hook (headless/TCP), keep the original unwind path.
             if (g_frame_present_hook) {
                 bool quit = g_frame_present_hook();
-                if (quit) g_frame_present_quit = true;  // sticky: full unwind
-                return quit;
+                if (quit) {
+                    g_frame_present_quit = true;  // sticky: full unwind
+                    return true;
+                }
+                const uint32_t call_depth = runtime_call_stack_depth();
+                const uint32_t call_depth_limit =
+                    present_in_place_call_depth_limit();
+                if (call_depth >= call_depth_limit) {
+                    static unsigned long long forced_unwinds = 0;
+                    ++forced_unwinds;
+                    // Keep the diagnostic useful without flooding stderr in a
+                    // guest that repeatedly builds long-lived script chains.
+                    if ((forced_unwinds & (forced_unwinds - 1u)) == 0u) {
+                        std::fprintf(stderr,
+                            "runtime: present-in-place call-depth unwind "
+                            "depth=%u limit=%u count=%llu pc=0x%08X\n",
+                            call_depth, call_depth_limit, forced_unwinds,
+                            g_cpu.R[15]);
+                    }
+                    return true;
+                }
+                return false;
             }
             return true;
         }

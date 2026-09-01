@@ -243,5 +243,27 @@ extern "C" int (*g_ws_obj_attr_x_provider)(int oam_index,
                                             std::uint16_t attr1,
                                             std::uint16_t attr2,
                                             int* out_x);
+// Opt-in policy for expanded rendering: when nonzero, OBJ pixels are clipped
+// to the native 240px viewport so sprites the guest parked just off-screen
+// (signed 9-bit X idiom) never appear inside widescreen margins. The OBJ x
+// providers above run first and may re-place known-safe sprites. Default 0
+// keeps the established expanded-viewport OBJ test.
+extern "C" int g_ws_obj_native_clip;
+// Optional game-owned final presentation pass for an expanded framebuffer.
+// It runs only after a complete wide frame has been latched, never on the
+// native renderer or serialized guest state. Games can use this for effects
+// whose intended full-screen coverage cannot be inferred from one GBA layer
+// in isolation. The callback may alter margin pixels; it must preserve the
+// authentic center viewport.
+extern "C" void (*g_ws_frame_postprocess)(std::uint8_t* rgb,
+                                            std::uint32_t width,
+                                            std::uint32_t height,
+                                            std::uint32_t extra_left,
+                                            std::uint32_t extra_right);
+
+// Debug-only compositor isolation used by deterministic capture/audit tools.
+// Bits 0..3 select BG0..BG3 and bit 4 selects OBJ. The faithful default keeps
+// every layer enabled; games and normal builds never need to touch this.
+extern "C" unsigned g_ppu_debug_layer_mask;
 
 }  // namespace gba
