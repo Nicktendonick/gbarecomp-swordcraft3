@@ -217,6 +217,18 @@ extern "C" int (*g_ws_tilemap_provider)(int bg, int hw_x, int screen_y,
 // hardware X through out_hw_x (1). The native 240x160 renderer never calls it.
 extern "C" int (*g_ws_bg_x_provider)(int bg, int output_x, int screen_y,
                                      int* out_hw_x);
+// Optional authoritative regular-BG margin sampling, with the *rendered*
+// scanline's registers/data rather than a frame-start estimate. Borrowed
+// pointers are valid only during the callback. Never called for native columns.
+// -1 suppresses; 0 delegates to the legacy hooks; 1 supplies hardware X and
+// accepts that sample's normal tilemap entry (bypasses legacy X/tilemap hooks).
+// Composition, palette, blending and sprite priority remain hardware-owned.
+struct WsBgMarginContext {
+    unsigned layer, output_x, screen_y, native_left, output_width;
+    const uint8_t* io;
+    const uint8_t* vram;
+};
+extern "C" int (*g_ws_bg_margin_provider)(const WsBgMarginContext*, int* out_hw_x);
 // Bitmask of regular BG layers that may use g_ws_bg_x_provider. Defaults to
 // all layers; game adapters can narrow it to avoid per-pixel callback traffic.
 extern "C" unsigned g_ws_bg_x_provider_layers;

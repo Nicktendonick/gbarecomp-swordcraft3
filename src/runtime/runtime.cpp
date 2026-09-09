@@ -1130,6 +1130,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     gba::g_ws_obj_x_provider = nullptr;
     gba::g_ws_obj_attr_x_provider = nullptr;
     gba::g_ws_bg_x_provider = nullptr;
+    gba::g_ws_bg_margin_provider = nullptr;
     gba::g_ws_bg_x_provider_layers = 0xFu;
     gba::g_ws_affine_filter_enabled = 0;
     gba::g_ws_affine_filter_provider = nullptr;

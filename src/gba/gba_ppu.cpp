@@ -23,6 +23,7 @@ extern "C" int (*g_ws_tilemap_provider)(int bg, int hw_x, int screen_y,
 extern "C" int (*g_ws_bg_x_provider)(int bg, int output_x, int screen_y,
                                      int* out_hw_x) = nullptr;
 extern "C" unsigned g_ws_bg_x_provider_layers = 0xFu;
+extern "C" int (*g_ws_bg_margin_provider)(const WsBgMarginContext*, int*) = nullptr;
 extern "C" int g_ws_affine_filter_enabled = 0;
 extern "C" int (*g_ws_affine_filter_provider)(int, int) = nullptr;
 extern "C" int g_ws_authored_margin_layers = 0;
@@ -1498,10 +1499,25 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
             // the native 240px WIN0/WIN1 HUD/dialog masks. Ignore only their
             // regular-BG layer gate there; unsupported UI BGs still fail in
             // the provider below, so they cannot repeat.
+            // Authored margins bypass guest window gates, never the host's
+            // explicit debug-layer selection. Otherwise isolated BG/OBJ views
+            // misleadingly contain every background in their extra columns.
+            if ((g_ppu_debug_layer_mask & (1u << layer)) == 0) continue;
             if (!layer_enabled(x, layer) && !authored_margin) continue;
             int sample_hx = hx;
             bool remapped = false;
-            if (g_ws_bg_x_provider &&
+            bool authoritative_margin = false;
+            if (g_ws_bg_margin_provider && (hx < 0 || hx >= 240)) {
+                const WsBgMarginContext context{layer, x, y, ox, out_w, io, vram};
+                int provided_hx = hx;
+                const int action = g_ws_bg_margin_provider(&context, &provided_hx);
+                if (action < 0) continue;
+                if (action > 0) {
+                    sample_hx = provided_hx;
+                    authoritative_margin = true;
+                }
+            }
+            if (!authoritative_margin && g_ws_bg_x_provider &&
                 (g_ws_bg_x_provider_layers & (1u << layer))) {
                 int provided_hx = hx;
                 const int action = g_ws_bg_x_provider(
@@ -1538,7 +1554,7 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
             // data, leave the pixel transparent (no seam) rather than draw the
             // wrap. With no sidecar, keep vanilla wide behavior.
             if (sample_hx < 0 || sample_hx >= 240) {
-                if (g_ws_tilemap_provider) {
+                if (!authoritative_margin && g_ws_tilemap_provider) {
                     uint16_t ext;
                     const int action = g_ws_tilemap_provider(
                         static_cast<int>(layer), sample_hx,

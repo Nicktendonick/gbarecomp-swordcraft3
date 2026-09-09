@@ -837,6 +837,42 @@ void test_extended_view_extends_nearest_window_edge() {
                  "authored provider did not reconstruct right margin");
     expect_pixel(wide.data() + ((24u + 100u) * 3u), 0, 255, 0,
                  "authored margin policy changed native window center");
+    gba::g_ppu_debug_layer_mask = 0x10u; // OBJ only: BG0 must stay hidden.
+    f.ppu.render(wide.data(), 0x2100, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(wide.data(), 0, 255, 0,
+                 "hidden background leaked into authored left margin");
+    expect_pixel(wide.data() + (287u * 3u), 0, 255, 0,
+                 "hidden background leaked into authored right margin");
+    gba::g_ppu_debug_layer_mask = 0x1Fu;
+    static unsigned context_calls = 0;
+    static int context_action = 1;
+    context_calls = 0;
+    context_action = 1;
+    store16(&f.io[0x10], 8); // Active scroll must reach the contextual hook.
+    g_margin_provider_action = gba::kWsTilemapUnavailable;
+    gba::g_ws_bg_margin_provider = +[](const gba::WsBgMarginContext* c, int* x) {
+        if (!c || !c->io || !c->vram || c->io[0x10] != 8 ||
+            (c->output_x >= c->native_left && c->output_x < c->native_left+240))
+            std::abort();
+        ++context_calls;
+        *x = -8; // With active HOFS=8 this selects authored tile column zero.
+        return context_action;
+    };
+    f.ppu.render(wide.data(), 0x2100, f.io.data(), f.vram.data(), f.oam.data(), f.pal.data());
+    expect_pixel(wide.data(), 255, 0, 0, "context sample failed active scroll/legacy bypass");
+    expect_pixel(wide.data()+287u*3u, 255, 0, 0, "context sample failed right margin");
+    if (!context_calls) std::abort();
+    for (int action : {-1, 0}) {
+        context_action = action;
+        f.ppu.render(wide.data(), 0x2100, f.io.data(), f.vram.data(), f.oam.data(), f.pal.data());
+        expect_pixel(wide.data(), 0, 255, 0, "context suppress/delegate failed");
+    }
+    const auto calls_before_native = context_calls;
+    f.ppu.set_view_margins(0, 0, 0, 0);
+    f.ppu.render(authentic.data(), 0x2100, f.io.data(), f.vram.data(), f.oam.data(), f.pal.data());
+    if (context_calls != calls_before_native) std::abort();
+    gba::g_ws_bg_margin_provider = nullptr;
     gba::g_ws_authored_margin_layers = 0;
     gba::g_ws_tilemap_provider = nullptr;
     g_margin_provider_action = gba::kWsTilemapReplace;
