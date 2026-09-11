@@ -181,6 +181,8 @@ private:
     std::array<uint8_t, kMaxFramebufferBytes> work_fb_{};
     std::array<uint8_t, kMaxFramebufferBytes> latched_fb_{};
     bool has_latched_fb_ = false;
+    friend class GbaRasterCapture;
+    bool presentation_callbacks_ = true; // replay instances never recapture themselves
 
     struct AffineLineState {
         int32_t x = 0;
@@ -198,6 +200,18 @@ private:
     uint32_t extra_top_    = 0;
     uint32_t extra_bottom_ = 0;
 };
+
+// Opt-in native raster capture and presentation seams. Default-null preserves
+// stock scanout. Observer runs before a line's hidden affine state advances.
+// Game policies/room reconstruction belong outside this engine interface.
+struct NativeRasterLineContext {
+    const GbaPpu* ppu;
+    unsigned y;
+    std::uint16_t dispcnt;
+    const std::uint8_t *io, *vram, *oam, *pal;
+};
+extern void (*g_native_raster_observer)(const NativeRasterLineContext&);
+extern void (*g_native_frame_presenter)(std::uint8_t* rgb, std::size_t bytes);
 
 // Widescreen margin tilemap provider (Step C; see gba_ppu.cpp). Set by the
 // runtime-side sidecar; nullptr = vanilla wide behavior.

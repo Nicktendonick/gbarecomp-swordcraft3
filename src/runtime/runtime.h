@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "host_frame.h"
 
 namespace gbarecomp {
 
@@ -73,6 +74,12 @@ struct RunOptions {
     // windowed aspect, while adaptive fullscreen follows the host display.
     std::uint16_t max_resize_view_width = 240;
     bool resize_driven_view = false;
+
+    // Separate host-only surface, authorized only while guest scanout is 240.
+    // Zero/null preserves every established renderer path. Fixed width for now.
+    std::uint16_t host_presentation_width = 0;
+    HostFrameRenderer host_frame_renderer = nullptr;
+    void (*host_frame_reset)() = nullptr; // startup, snapshot load and rewind
 
     // Host-window presentation policy, independent of extended guest view.
     // When true the player may freely reshape a window while SDL keeps the

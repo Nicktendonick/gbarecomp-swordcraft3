@@ -21,6 +21,7 @@
 
 #include "runtime.h"
 #include "view_config.h"
+#include "host_presentation.h"
 
 #include "asset_picker.h"
 #include "bios_hle.h"
@@ -1131,6 +1132,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     gba::g_ws_obj_attr_x_provider = nullptr;
     gba::g_ws_bg_x_provider = nullptr;
     gba::g_ws_bg_margin_provider = nullptr;
+    gba::g_native_raster_observer = nullptr;
+    gba::g_native_frame_presenter = nullptr;
     gba::g_ws_bg_x_provider_layers = 0xFu;
     gba::g_ws_affine_filter_enabled = 0;
     gba::g_ws_affine_filter_provider = nullptr;
@@ -2009,6 +2012,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         // explicitly restart its already-registered source. The host bridge's
         // already-queued native audio remains a separate future flush concern.
         gba_mod_audio_on_savestate_load();
+        if (opts.host_frame_reset) opts.host_frame_reset();
         sync_frame_counter();  // realign vblank_count with restored PPU
         // Re-origin the fingerprint cycle clock + ring at the load point so the
         // recomp and interp oracle share a cycle origin for diff_cycle_trace.py.
@@ -2029,6 +2033,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                                      make_snapshot_ctx(), &e)) {
             return false;
         }
+        if (opts.host_frame_reset) opts.host_frame_reset();
         sync_frame_counter();
         g_runtime_cycles = 0;
         runtime_fp_reset();
@@ -2268,6 +2273,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
 
     HostWindow win;
     std::vector<uint8_t> live_fb;
+    HostPresentation host_surface(opts.host_presentation_width, opts.host_frame_renderer);
+    if (opts.host_frame_reset) opts.host_frame_reset();
     // Optional delivered-PCM evidence stream. This captures the signed
     // interleaved S16 samples after guest/mod mixing but before SDL buffering,
     // so reference-audio tools can compare content without device jitter.
@@ -2344,7 +2351,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         const auto report_path = directory / "report.json";
         std::string state_error;
         const bool frame_ok = write_png(frame_path.string(), live_fb.data(),
-                                        ppu.render_width(), ppu.render_height());
+                                        host_surface.width(ppu), ppu.render_height());
         const bool state_ok = do_savestate_save(state_path.string(), state_error);
         gbarecomp::cosim::SubHashes sub{};
         const std::uint64_t state_hash = gbarecomp::cosim::state_hash(&sub);
@@ -2354,6 +2361,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                << "  \"pc\": \"0x" << std::hex << std::uppercase
                << (g_cpu.R[15] & ~1u) << std::dec << "\",\n"
                << "  \"view_width\": " << ppu.render_width() << ",\n"
+               << "  \"host_width\": " << host_surface.width(ppu) << ",\n"
                << "  \"layer_mask\": " << gba::g_ppu_debug_layer_mask << ",\n"
                << "  \"guest_state_fnv64\": \"" << std::hex
                << state_hash << std::dec << "\",\n"
@@ -2508,7 +2516,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         // midway through the host loop. Publish immediately so the fresh frame
         // rendered below uses the new game's policy rather than the prior size.
         publish_extended_view_frame();
-        live_fb.assign(ppu.render_bytes(), 0);
+        live_fb.assign(host_surface.bytes(ppu), 0);
         return true;
     };
     auto sync_resize_driven_view = [&]() -> bool {
@@ -2564,7 +2572,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         const char* runtime_title =
             opts.builtin_game_name && *opts.builtin_game_name
                 ? opts.builtin_game_name : GBARECOMP_WINDOW_TITLE;
-        if (!win.open(args.scale, ppu.render_width(), ppu.render_height(),
+        if (!win.open(args.scale, host_surface.width(ppu), ppu.render_height(),
                       runtime_title,
                       args.screen.empty() ? nullptr : args.screen.c_str(),
                       args.linear_filter, args.sharp_filter,
@@ -2774,7 +2782,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         win.set_runtime_ui(runtime_ui_context.ui);
 #endif
         sync_resize_driven_view();
-        if (live_fb.empty()) live_fb.assign(ppu.render_bytes(), 0);
+        if (live_fb.empty()) live_fb.assign(host_surface.bytes(ppu), 0);
         const char* unthrottled_capture =
             std::getenv("GBARECOMP_UNTHROTTLED_CAPTURE");
         if (!(framedump_dir && unthrottled_capture &&
@@ -3139,6 +3147,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 static_cast<unsigned>(ev.debug_layer_mask) & 0x1fu;
             ppu.render(live_fb.data(), bus.io().read16(0x000), bus.io().raw(),
                        bus.vram_ptr(), bus.oam_ptr(), bus.pal_ptr());
+            host_surface.compose(live_fb, ppu, false);
             win.present(live_fb.data());
             std::printf("debugger: layer_mask=0x%02X\n",
                         gba::g_ppu_debug_layer_mask);
@@ -3304,7 +3313,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                          fast_forward_multiplier) == 0);
                 if (present_frame) {
                     const bool view_changed = sync_resize_driven_view();
-                    if (ppu.has_latched_framebuffer() && !view_changed) {
+                    const bool latched = ppu.has_latched_framebuffer() && !view_changed;
+                    if (latched) {
                         std::memcpy(live_fb.data(), ppu.latched_framebuffer(),
                                     ppu.render_bytes());
                     } else {
@@ -3312,6 +3322,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                                    bus.io().raw(), bus.vram_ptr(), bus.oam_ptr(),
                                    bus.pal_ptr());
                     }
+                    host_surface.compose(live_fb, ppu, latched && gba::g_ppu_debug_layer_mask == 0x1f);
                 }
                 const uint64_t fp_t1 = FramePhaseRing::now_ns();
                 if (present_frame) win.present(live_fb.data());
@@ -3681,7 +3692,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                          fast_forward_multiplier) == 0);
                 if (present_frame) {
                     const bool view_changed = sync_resize_driven_view();
-                    if (ppu.has_latched_framebuffer() && !view_changed) {
+                    const bool latched = ppu.has_latched_framebuffer() && !view_changed;
+                    if (latched) {
                         std::memcpy(live_fb.data(), ppu.latched_framebuffer(),
                                     ppu.render_bytes());
                     } else {
@@ -3689,6 +3701,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                                    bus.io().raw(), bus.vram_ptr(), bus.oam_ptr(),
                                    bus.pal_ptr());
                     }
+                    host_surface.compose(live_fb, ppu, latched && gba::g_ppu_debug_layer_mask == 0x1f);
                 }
                 const uint64_t fp_t1 = FramePhaseRing::now_ns();
                 if (present_frame) win.present(live_fb.data());
@@ -3699,7 +3712,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     char p[512];
                     std::snprintf(p, sizeof(p), "%s/f_%06llu.png", framedump_dir,
                                   static_cast<unsigned long long>(frame));
-                    write_png(p, live_fb.data(), ppu.render_width(),
+                    write_png(p, live_fb.data(), host_surface.width(ppu),
                               ppu.render_height());
                     if (++framedump_written >= framedump_max) host_quit = true;
                 }

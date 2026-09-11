@@ -11,6 +11,8 @@
 #include "snapshot.h"
 
 namespace gba {
+void (*g_native_raster_observer)(const NativeRasterLineContext&) = nullptr;
+void (*g_native_frame_presenter)(std::uint8_t*, std::size_t) = nullptr;
 
 // Widescreen margin tilemap provider (Step C). When set (by the runtime-side
 // sidecar) and the wide path samples a margin column (hardware x outside
@@ -2311,6 +2313,8 @@ void GbaPpu::render_scanline(uint32_t y,
                              const uint8_t* vram,
                              const uint8_t* oam,
                              const uint8_t* pal) {
+    if (presentation_callbacks_ && !view_expanded() && g_native_raster_observer)
+        g_native_raster_observer({this,y,dispcnt,io,vram,oam,pal});
     // BG2/BG3 affine coordinates are backed by hidden current-reference
     // registers. With constant PB/PD, ref + y*delta is equivalent. Mario Kart
     // HBlank-DMAs PA/PB/PC/PD/X/Y for every road scanline, however: each X/Y
@@ -2374,6 +2378,8 @@ void GbaPpu::latch_framebuffer(uint16_t dispcnt,
 
 void GbaPpu::mark_framebuffer_latched() {
     std::memcpy(latched_fb_.data(), work_fb_.data(), render_bytes());
+    if (presentation_callbacks_ && !view_expanded() && g_native_frame_presenter)
+        g_native_frame_presenter(latched_fb_.data(), kFramebufferBytes);
     if (view_expanded() && g_ws_frame_postprocess) {
         g_ws_frame_postprocess(latched_fb_.data(), render_width(),
                                render_height(), extra_left_, extra_right_);
