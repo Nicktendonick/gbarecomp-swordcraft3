@@ -2105,6 +2105,26 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     };
 
     if (args.tcp_port > 0) {
+        // TCP returns before the window/headless presentation setup below.
+        // Publish identical immutable-renderer inputs on this path as well.
+        auto publish_debug_frame = [&]() {
+            if (!opts.extended_view_frame) return;
+            ExtendedViewFrameInfo info{};
+            info.frame_count=ppu.frame_count(); info.view_width=ppu.render_width();
+            info.extra_left=ppu.view_extra_left(); info.extra_right=ppu.view_extra_right();
+            info.io=bus.io().raw(); info.io_size=gba::GbaIo::kIoSize;
+            info.ewram=bus.ewram_ptr(); info.ewram_size=256u*1024u;
+            info.iwram=bus.iwram_ptr(); info.iwram_size=32u*1024u;
+            info.vram=bus.vram_ptr(); info.vram_size=96u*1024u;
+            info.rom=bus.rom_ptr(); info.rom_size=bus.rom_size();
+            opts.extended_view_frame(&info);
+        };
+        if (opts.host_frame_reset) opts.host_frame_reset();
+        if (opts.extended_view_frame) {
+            runtime_set_frame_start_hook(publish_debug_frame);
+            publish_debug_frame();
+        }
+        HostPresentation debug_surface(opts.host_presentation_width,opts.host_frame_renderer);
         // ── Free-run threading model ───────────────────────────────────────
         // The game CORE runs on a dedicated thread; the TCP server runs on THIS
         // (main) thread. Synchronous `step` (oracle lockstep) signals the game
@@ -2179,6 +2199,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         ctx.runtime_trace_copy = runtime_trace_copy_recent;
         ctx.bus = &bus;
         ctx.ppu = &ppu;
+        ctx.host_screenshot = [&](std::vector<uint8_t>& rgb,unsigned& w,unsigned& h) {
+            if (!park_and_wait(2000) || !ppu.has_latched_framebuffer()) return false;
+            rgb.assign(ppu.latched_framebuffer(),ppu.latched_framebuffer()+ppu.render_bytes());
+            debug_surface.compose(rgb,ppu);
+            w=debug_surface.width(ppu); h=ppu.render_height(); return true;
+        };
         // Synchronous step: drive ONE frame on the game thread and wait for it.
         // Same observable semantics as the old in-line step (the WRAM trace fires
         // on the game thread inside step). Oracle lockstep scripts are unaffected.

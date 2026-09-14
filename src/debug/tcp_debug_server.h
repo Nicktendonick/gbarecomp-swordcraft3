@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 struct ArmCpuState;
 struct RuntimeTraceEntry;
@@ -64,6 +65,8 @@ public:
         SnapshotFn        savestate_load;  // restore full machine state
         FpSaveFn          fp_save;          // dump fingerprint ring to a file
         RuntimeTraceCopyFn runtime_trace_copy;
+        // Optional composed host surface. Kept separate from the native oracle.
+        std::function<bool(std::vector<uint8_t>&, unsigned&, unsigned&)> host_screenshot;
         // Mirror of the host's counters so `counters` queries can
         // report them. Host updates these between commands.
         uint64_t* irq_entries        = nullptr;

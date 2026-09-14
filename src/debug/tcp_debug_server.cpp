@@ -945,6 +945,15 @@ void dispatch(const TcpDebugServer::Context& ctx, std::string_view req,
         out = body;
         return;
     }
+    if (contains("\"host_screenshot\"")) {
+        std::vector<uint8_t> rgb;
+        unsigned w=0,h=0;
+        if (!ctx.host_screenshot || !ctx.host_screenshot(rgb,w,h)) {
+            emit_error(out,"host screenshot requires a parked, completed frame"); return;
+        }
+        out="{\"ok\":true,\"w\":"+std::to_string(w)+",\"h\":"+std::to_string(h)+",\"data\":";
+        json_emit_hex(out,rgb.data(),rgb.size()); out+="}"; return;
+    }
     if (contains("\"screenshot\"")) {
         if (!ctx.bus || !ctx.ppu) { emit_error(out, "ppu unavailable"); return; }
         const uint8_t* rgb = nullptr;
