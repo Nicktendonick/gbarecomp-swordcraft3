@@ -26,6 +26,18 @@ namespace gbarecomp::debug { class SnapshotWriter; class SnapshotReader; }
 
 namespace gba {
 
+struct WsBgMarginContext;
+// Instance-local immutable replay policy. It does not install or mutate the
+// live PPU's global enhancement callbacks. Defaults keep objects native-clipped.
+struct GbaReplayViewPolicy {
+    const void* user = nullptr;
+    int (*bg_margin)(const void*, const WsBgMarginContext*, int*) = nullptr;
+    int (*obj_x)(int, int*) = nullptr;
+    bool authored_backgrounds = false;
+    bool clip_objects = true;
+    unsigned occlusion_layers = 0;
+};
+
 class GbaPpu {
 public:
     // Hardware constants.
@@ -183,6 +195,7 @@ private:
     bool has_latched_fb_ = false;
     friend class GbaRasterCapture;
     bool presentation_callbacks_ = true; // replay instances never recapture themselves
+    const GbaReplayViewPolicy* replay_view_policy_ = nullptr;
 
     struct AffineLineState {
         int32_t x = 0;

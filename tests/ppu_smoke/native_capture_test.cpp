@@ -6,6 +6,10 @@
 #include <stdexcept>
 
 static void check(bool ok) { if (!ok) throw std::runtime_error("native capture assertion"); }
+static unsigned replay_postprocess_calls=0;
+static void poison_postprocess(std::uint8_t*,std::uint32_t,std::uint32_t,std::uint32_t,std::uint32_t) {
+    ++replay_postprocess_calls;
+}
 int main() {
     try {
         auto capture=std::make_unique<gba::GbaRasterCapture>();
@@ -29,7 +33,10 @@ int main() {
         check(!sample(0,0,0,1,0)); // transparent index zero
         std::puts("regular OBJ sampling guards PASS");
         std::array<std::uint8_t,gba::GbaPpu::kFramebufferBytes> replay{},again{};
+        std::array<std::uint8_t,284*160*3> wide{};
+        gba::GbaReplayViewPolicy view_policy;
         check(!capture->draw_native(replay.data(),replay.size()));
+        check(!capture->draw_view(wide.data(),wide.size(),284,view_policy));
         for(unsigned mode=0; mode<=5; ++mode) {
             ppu->reset(); capture->reset();
             io.fill(0); pal.fill(0); vram.fill(0); oam.fill(0);
@@ -53,6 +60,20 @@ int main() {
             io.fill(0xAA);vram.fill(0x55);oam.fill(0xCC);pal.fill(0xFF);ppu->reset();
             check(capture->draw_native(again.data(),again.size()));
             check(replay==again); // no borrowed state survives capture
+            const auto saved_postprocess=gba::g_ws_frame_postprocess;
+            const int saved_pillarbox=gba::g_ws_pillarbox;
+            gba::g_ws_frame_postprocess=poison_postprocess;
+            gba::g_ws_pillarbox=1;
+            check(capture->draw_view(wide.data(),wide.size(),284,view_policy));
+            check(replay_postprocess_calls==0 && gba::g_ws_pillarbox==1 &&
+                  gba::g_ws_frame_postprocess==poison_postprocess);
+            gba::g_ws_frame_postprocess=saved_postprocess;
+            gba::g_ws_pillarbox=saved_pillarbox;
+            for(unsigned y=0;y<160;++y)
+                check(!std::memcmp(wide.data()+(y*284+22)*3,replay.data()+y*240*3,240*3));
+            check(!capture->draw_view(wide.data(),wide.size(),240,view_policy));
+            check(!capture->draw_view(wide.data(),wide.size(),481,view_policy));
+            check(!capture->draw_view(wide.data(),1,284,view_policy));
             check(!capture->draw_native(again.data(),1));
             check(!capture->capture({ppu.get(),12,0,io.data(),vram.data(),oam.data(),pal.data()}));
             check(!capture->draw_native(again.data(),again.size()));

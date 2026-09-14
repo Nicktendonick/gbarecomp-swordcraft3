@@ -56,5 +56,26 @@ public:
         std::memcpy(output,replay->latched_framebuffer(),bytes);
         return true;
     }
+    // Replay the same immutable rows through the wide pixel kernel, with an
+    // instance-local policy. No guest execution or global policy mutation.
+    // Callers still authenticate scenes and compare the original viewport.
+    bool draw_view(std::uint8_t* output, std::size_t bytes, unsigned width,
+                   const GbaReplayViewPolicy& policy) const {
+        if(!complete() || !output || width<=240 || width>GbaPpu::kMaxRenderWidth ||
+           bytes!=std::size_t(width)*160*3) return false;
+        auto replay=std::make_unique<GbaPpu>();
+        replay->presentation_callbacks_=false;
+        replay->replay_view_policy_=&policy;
+        const unsigned left=(width-240)/2;
+        replay->set_view_margins(left,width-240-left,0,0);
+        for(unsigned y=0;y<160;++y) {
+            const auto& l=(*lines_)[y];
+            replay->affine_line_=l.affine;
+            replay->render_scanline(y,l.dispcnt,l.io.data(),l.vram.data(),l.oam.data(),l.pal.data());
+        }
+        replay->mark_framebuffer_latched();
+        std::memcpy(output,replay->latched_framebuffer(),bytes);
+        return true;
+    }
 };
 }

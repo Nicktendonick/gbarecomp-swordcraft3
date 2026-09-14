@@ -1331,7 +1331,23 @@ void render_scanline_internal(uint8_t* rgb,
 void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
                           const uint8_t* io, const uint8_t* vram,
                           const uint8_t* oam, const uint8_t* pal,
-                          uint32_t out_w, uint32_t ox) {
+                          uint32_t out_w, uint32_t ox,
+                          const GbaReplayViewPolicy* replay_policy = nullptr) {
+    // Ordinary live rendering retains existing globals. Replay never borrows
+    // legacy map/OBJ/postprocess policies from another scene or game instance.
+    const auto g_ws_tilemap_provider = replay_policy ? nullptr : gba::g_ws_tilemap_provider;
+    const auto g_ws_bg_x_provider = replay_policy ? nullptr : gba::g_ws_bg_x_provider;
+    const auto g_ws_bg_x_provider_layers = replay_policy ? 0u : gba::g_ws_bg_x_provider_layers;
+    const auto g_ws_affine_filter_enabled = replay_policy ? 0 : gba::g_ws_affine_filter_enabled;
+    const auto g_ws_affine_filter_provider = replay_policy ? nullptr : gba::g_ws_affine_filter_provider;
+    const auto g_ws_authored_margin_layers = replay_policy ? int(replay_policy->authored_backgrounds) : gba::g_ws_authored_margin_layers;
+    const auto g_ws_obj_x_provider = replay_policy ? replay_policy->obj_x : gba::g_ws_obj_x_provider;
+    const auto g_ws_obj_attr_x_provider = replay_policy ? nullptr : gba::g_ws_obj_attr_x_provider;
+    const auto g_ws_obj_native_clip = replay_policy ? int(replay_policy->clip_objects) : gba::g_ws_obj_native_clip;
+    const auto g_ws_margin_occlusion_layers = replay_policy ? replay_policy->occlusion_layers : gba::g_ws_margin_occlusion_layers;
+    const auto g_ws_pillarbox = replay_policy ? 0 : gba::g_ws_pillarbox;
+    const auto g_ws_pillarbox_left = replay_policy ? 0 : gba::g_ws_pillarbox_left;
+    const auto g_ws_pillarbox_right = replay_policy ? 0 : gba::g_ws_pillarbox_right;
     constexpr uint32_t kVanW = GbaPpu::kScreenWidth;   // 240
     constexpr uint32_t kVanH = GbaPpu::kScreenHeight;  // 160
     if (y >= kVanH) return;
@@ -1509,10 +1525,11 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
             int sample_hx = hx;
             bool remapped = false;
             bool authoritative_margin = false;
-            if (g_ws_bg_margin_provider && (hx < 0 || hx >= 240)) {
+            if ((replay_policy ? replay_policy->bg_margin != nullptr : g_ws_bg_margin_provider != nullptr) && (hx < 0 || hx >= 240)) {
                 const WsBgMarginContext context{layer, x, y, ox, out_w, io, vram};
                 int provided_hx = hx;
-                const int action = g_ws_bg_margin_provider(&context, &provided_hx);
+                const int action = replay_policy ? replay_policy->bg_margin(replay_policy->user, &context, &provided_hx) :
+                    g_ws_bg_margin_provider(&context, &provided_hx);
                 if (action < 0) continue;
                 if (action > 0) {
                     sample_hx = provided_hx;
@@ -2357,7 +2374,7 @@ void GbaPpu::render_scanline(uint32_t y,
         return;
     }
     render_scanline_wide(work_fb_.data(), y, dispcnt, affine_io.data(),
-                         vram, oam, pal, render_width(), extra_left_);
+                         vram, oam, pal, render_width(), extra_left_, replay_view_policy_);
 }
 
 void GbaPpu::note_affine_reference_write(unsigned bg, bool y_axis) {
@@ -2380,7 +2397,7 @@ void GbaPpu::mark_framebuffer_latched() {
     std::memcpy(latched_fb_.data(), work_fb_.data(), render_bytes());
     if (presentation_callbacks_ && !view_expanded() && g_native_frame_presenter)
         g_native_frame_presenter(latched_fb_.data(), kFramebufferBytes);
-    if (view_expanded() && g_ws_frame_postprocess) {
+    if (presentation_callbacks_ && view_expanded() && g_ws_frame_postprocess) {
         g_ws_frame_postprocess(latched_fb_.data(), render_width(),
                                render_height(), extra_left_, extra_right_);
     }
