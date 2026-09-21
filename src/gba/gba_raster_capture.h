@@ -58,7 +58,7 @@ public:
     }
     // Replay the same immutable rows through the wide pixel kernel, with an
     // instance-local policy. No guest execution or global policy mutation.
-    // Callers still authenticate scenes and compare the original viewport.
+    // Callers own scene eligibility and preservation of the native viewport.
     bool draw_view(std::uint8_t* output, std::size_t bytes, unsigned width,
                    const GbaReplayViewPolicy& policy) const {
         if(!complete() || !output || width<=240 || width>GbaPpu::kMaxRenderWidth ||

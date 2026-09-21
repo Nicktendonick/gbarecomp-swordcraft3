@@ -36,6 +36,10 @@ struct GbaReplayViewPolicy {
     bool authored_backgrounds = false;
     bool clip_objects = true;
     unsigned occlusion_layers = 0;
+    // Optional authored text-map entry in margin columns only. Negative skips
+    // the sample, zero keeps the captured entry, positive supplies *entry.
+    // Tile decoding, palette, priority and effects still use captured state.
+    int (*text_margin_entry)(const void*, const WsBgMarginContext*, std::uint16_t*) = nullptr;
 };
 
 class GbaPpu {

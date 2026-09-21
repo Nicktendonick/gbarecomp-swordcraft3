@@ -1585,6 +1585,13 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
                     }
                 }
             }
+            if (replay_policy && replay_policy->text_margin_entry && (hx < 0 || hx >= 240)) {
+                const WsBgMarginContext context{layer, x, y, ox, out_w, io, vram};
+                uint16_t provided_entry = entry;
+                const int action = replay_policy->text_margin_entry(replay_policy->user, &context, &provided_entry);
+                if (action < 0) continue;
+                if (action > 0) entry = provided_entry;
+            }
             uint32_t tile_num = entry & 0x03FFu;
             bool hflip = (entry & 0x0400u) != 0;
             bool vflip = (entry & 0x0800u) != 0;
