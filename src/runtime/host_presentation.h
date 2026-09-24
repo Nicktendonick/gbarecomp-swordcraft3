@@ -31,8 +31,11 @@ public:
         std::memcpy(native_.data(), fb.data(), native_.size());
         fb.assign(bytes(ppu), 0);
         const unsigned left=(requested_-240)/2;
-        if (permit && !draw_({native_.data(),fb.data(),requested_,160,left}))
+        HostFrameOwnership ownership=HostFrameOwnership::native_center;
+        const bool succeeded=permit && draw_({native_.data(),fb.data(),requested_,160,left,&ownership});
+        if (!succeeded)
             std::fill(fb.begin(),fb.end(),0); // partial/invalid callbacks fail closed
+        if (host_frame_owns_center(succeeded,ownership)) return;
         for (unsigned y=0;y<160;++y)
             std::memcpy(fb.data()+(y*requested_+left)*3,native_.data()+y*240*3,240*3);
     }
