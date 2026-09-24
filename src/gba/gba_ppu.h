@@ -40,6 +40,29 @@ struct GbaReplayViewPolicy {
     // the sample, zero keeps the captured entry, positive supplies *entry.
     // Tile decoding, palette, priority and effects still use captured state.
     int (*text_margin_entry)(const void*, const WsBgMarginContext*, std::uint16_t*) = nullptr;
+    // Regular BG0..BG3 whose authored margin samples may bypass their guest
+    // window layer gate. Other backgrounds retain captured WIN0/WIN1/OBJ-window
+    // permissions. Never bypasses DISPCNT/debug-layer enables or color-effect
+    // permissions; affine backgrounds are unaffected. The legacy Boolean above
+    // continues to authorize all four regular layers when true.
+    unsigned regular_bg_window_bypass_layers = 0;
+    constexpr unsigned regular_bg_window_bypass_mask() const {
+        return authored_backgrounds ? 0x0Fu : (regular_bg_window_bypass_layers & 0x0Fu);
+    }
+    // Optional signed horizontal [left,right) continuation for WIN0/1 in
+    // margin columns only. Called at most once per enabled window per replay
+    // scanline with that row's immutable captured IO. Window is 0 or 1. A
+    // false result or right <= left keeps the captured horizontal bounds.
+    // Native columns, vertical bounds, window priority, and every WININ bit
+    // (including color effects) retain their captured semantics.
+    bool (*window_margin_bounds)(const void*, unsigned window, unsigned y,
+                                 const std::uint8_t* io, int* left, int* right) = nullptr;
+    // Optional per-row eligibility for BG0..3/OBJ in margin columns (bits 0..4).
+    // Restriction only: cannot enable a DISPCNT/debug/window-disabled layer or
+    // be overridden by authored-background window bypass. Native columns and
+    // color-effect permissions are unchanged. Null preserves all five layers.
+    unsigned (*margin_layer_mask)(const void*, unsigned y, std::uint16_t dispcnt,
+                                  const std::uint8_t* io) = nullptr;
 };
 
 class GbaPpu {

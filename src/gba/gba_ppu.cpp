@@ -1,6 +1,7 @@
 // gba_ppu.cpp — see gba_ppu.h.
 
 #include "gba_ppu.h"
+#include "gba_window_policy.h"
 #include "foreign_presentation_internal.h"
 
 #include <cstddef>
@@ -1322,8 +1323,9 @@ void render_scanline_internal(uint8_t* rgb,
 // render_scanline_internal above, so OFF-mode stays byte-identical by construc-
 // tion. For central hx in [0,240) the per-pixel logic is the same as vanilla;
 // margin columns extend the BG scroll / affine extrapolation / OBJ sampling into
-// the surrounding map. WIN0/WIN1 register tests are NOT widened — a margin hx
-// falls outside [X1,X2) so it naturally resolves to WINOUT (the conservative
+// the surrounding map. WIN0/WIN1 register tests are not widened by default;
+// a replay policy may supply signed horizontal continuation in margins only.
+// Otherwise a margin hx naturally resolves to WINOUT (the conservative
 // policy for columns the game never authored). OAM X keeps its 9-bit signed
 // decode and is tested against the expanded viewport, so wrapped-negative sprites
 // (left) and x>=240 sprites (right) both appear in the margins. Vertical is not
@@ -1341,6 +1343,9 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
     const auto g_ws_affine_filter_enabled = replay_policy ? 0 : gba::g_ws_affine_filter_enabled;
     const auto g_ws_affine_filter_provider = replay_policy ? nullptr : gba::g_ws_affine_filter_provider;
     const auto g_ws_authored_margin_layers = replay_policy ? int(replay_policy->authored_backgrounds) : gba::g_ws_authored_margin_layers;
+    const unsigned regular_bg_window_bypass_mask = replay_policy ?
+        replay_policy->regular_bg_window_bypass_mask() :
+        (g_ws_authored_margin_layers ? 0x0Fu : 0u);
     const auto g_ws_obj_x_provider = replay_policy ? replay_policy->obj_x : gba::g_ws_obj_x_provider;
     const auto g_ws_obj_attr_x_provider = replay_policy ? nullptr : gba::g_ws_obj_attr_x_provider;
     const auto g_ws_obj_native_clip = replay_policy ? int(replay_policy->clip_objects) : gba::g_ws_obj_native_clip;
@@ -1377,16 +1382,28 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
         if (y2 > kVanH || y1 > y2) y2 = kVanH;
         return y >= y1 && y < y2;
     };
-    auto win_h_in = [&](uint32_t hreg, int hx) -> bool {
-        uint32_t h  = static_cast<uint32_t>(io[hreg] | (io[hreg + 1] << 8));
-        int x1 = static_cast<int>((h >> 8) & 0xFFu), x2 = static_cast<int>(h & 0xFFu);
-        if (x2 > static_cast<int>(kVanW) || x1 > x2) x2 = static_cast<int>(kVanW);
-        return hx >= x1 && hx < x2;
+    struct MarginWindowBounds { bool valid = false; int left = 0; int right = 0; };
+    MarginWindowBounds margin_windows[2];
+    if (replay_policy && replay_policy->window_margin_bounds) {
+        for (unsigned window = 0; window < 2; ++window) {
+            if (!(dispcnt & (0x2000u << window))) continue;
+            auto& bounds = margin_windows[window];
+            bounds.valid = replay_policy->window_margin_bounds(
+                replay_policy->user, window, y, io, &bounds.left, &bounds.right);
+            bounds.valid = bounds.valid && bounds.right > bounds.left;
+        }
+    }
+    auto win_h_in = [&](unsigned window, int hx) -> bool {
+        const unsigned hreg = 0x40 + window * 2;
+        const auto h = static_cast<std::uint16_t>(io[hreg] | (io[hreg + 1] << 8));
+        const auto& bounds = margin_windows[window];
+        return detail::replay_window_horizontal_contains(
+            h, hx, static_cast<int>(kVanW), bounds.valid, bounds.left, bounds.right);
     };
     const bool win0_row = win0_en && win_v_row(0x44);
     const bool win1_row = win1_en && win_v_row(0x46);
     // OBJ-window stencil is built in vanilla 240-space; margin columns (hx
-    // outside [0,240)) get no OBJ-window (WINOUT), consistent with WIN0/1.
+    // outside [0,240)) get no OBJ-window. Extended WIN0/1 still take priority.
     bool obj_window_storage[GbaPpu::kScreenWidth] = {};
     bool* obj_window_mask = nullptr;
     if (objwin_en) {
@@ -1395,13 +1412,11 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
         obj_window_mask = obj_window_storage;
     }
     auto window_control_at_hx = [&](int hx) -> uint16_t {
-        if (!any_window) return 0x3Fu;
-        if (win0_row && win_h_in(0x40, hx)) return winin & 0x3Fu;
-        if (win1_row && win_h_in(0x42, hx)) return (winin >> 8) & 0x3Fu;
-        if (obj_window_mask && hx >= 0 && hx < static_cast<int>(kVanW) &&
-            obj_window_mask[hx])
-            return static_cast<uint16_t>((winout >> 8) & 0x3Fu);
-        return static_cast<uint16_t>(winout & 0x3Fu);
+        const bool obj_window = obj_window_mask && hx >= 0 &&
+            hx < static_cast<int>(kVanW) && obj_window_mask[hx];
+        return detail::replay_window_control(any_window,
+            win0_row && win_h_in(0, hx), win1_row && win_h_in(1, hx),
+            obj_window, winin, winout);
     };
     // A guest-authored window has no defined continuation beyond the native
     // 240-pixel scanline. Extend it into the margins only when every authentic
@@ -1441,8 +1456,15 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
     uint8_t window_controls[GbaPpu::kMaxRenderWidth];
     for (uint32_t x = 0; x < out_w; ++x)
         window_controls[x] = static_cast<uint8_t>(window_control(x) & 0x3Fu);
+    const unsigned margin_layers = replay_policy && replay_policy->margin_layer_mask ?
+        (replay_policy->margin_layer_mask(replay_policy->user, y, dispcnt, io) & 0x1Fu) : 0x1Fu;
+    auto margin_layer_allowed = [&](uint32_t x, uint32_t layer_bit) -> bool {
+        return detail::replay_margin_layer_allowed(margin_layers, layer_bit,
+            static_cast<int>(x) - static_cast<int>(ox), static_cast<int>(kVanW));
+    };
     auto layer_enabled = [&](uint32_t x, uint32_t layer_bit) -> bool {
-        return (g_ppu_debug_layer_mask & (1u << layer_bit)) != 0 &&
+        return margin_layer_allowed(x, layer_bit) &&
+               (g_ppu_debug_layer_mask & (1u << layer_bit)) != 0 &&
                (window_controls[x] & (1u << layer_bit)) != 0;
     };
     auto blend_enabled = [&](uint32_t x) -> bool {
@@ -1509,10 +1531,13 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
         uint32_t width_px = width_tiles * 8u;
         uint32_t height_px = height_tiles * 8u;
         uint32_t block_cols = width_tiles / 32u;
+        const bool authored_layer = (regular_bg_window_bypass_mask & (1u << layer)) != 0;
         for (uint32_t x = 0; x < out_w; ++x) {
             int hx = static_cast<int>(x) - static_cast<int>(ox);
-            const bool authored_margin = g_ws_authored_margin_layers &&
+            const bool authored_margin = authored_layer &&
                 (hx < 0 || hx >= static_cast<int>(kVanW));
+            // A replay restriction is stronger than authored window bypass.
+            if (!margin_layer_allowed(x, layer)) continue;
             // Minish supplies room-map entries for margins independently of
             // the native 240px WIN0/WIN1 HUD/dialog masks. Ignore only their
             // regular-BG layer gate there; unsupported UI BGs still fail in
