@@ -725,6 +725,13 @@ add_executable(audio_drc_tests tests/runtime/audio_drc_test.cpp)
 target_include_directories(audio_drc_tests PRIVATE src/runtime)
 add_test(NAME audio_drc_tests COMMAND audio_drc_tests)
 
+# Backported from upstream 1ea8647: diagnostic state is not guest state.
+add_executable(diagnostic_capture_tests tests/runtime/diagnostic_capture_test.cpp)
+target_include_directories(diagnostic_capture_tests PRIVATE src/gba src/runtime src/armv4t)
+target_link_libraries(diagnostic_capture_tests PRIVATE gbarecomp_gba)
+add_test(NAME diagnostic_capture_tests_disabled COMMAND diagnostic_capture_tests --disabled)
+add_test(NAME diagnostic_capture_tests_enabled COMMAND diagnostic_capture_tests --enabled)
+
 # Self-heal proposal clustering — pure logic, links only the standalone
 # clustering TU (no runtime/bus/overlay dependencies).
 add_executable(selfheal_cluster_test

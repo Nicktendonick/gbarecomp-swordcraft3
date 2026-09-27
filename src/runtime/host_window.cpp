@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -79,6 +80,16 @@ constexpr int assist_pad_axis(int code, bool positive) {
 
 bool assist_pad_down(SDL_GameController* controller, int binding) {
     if (!controller || !SDL_GameControllerGetAttached(controller)) return false;
+    if (binding >= 1000) {
+        const unsigned mask = static_cast<unsigned>(binding - 1000);
+        if (!mask) return false;
+        for (unsigned bit = 0; bit < 32; ++bit)
+            if ((mask & (1u << bit)) &&
+                (bit >= SDL_CONTROLLER_BUTTON_MAX ||
+                 !SDL_GameControllerGetButton(controller, static_cast<SDL_GameControllerButton>(bit))))
+                return false;
+        return true;
+    }
     if (binding > 0 && binding < 100) {
         const int code = binding - 1;
         return code >= 0 && code < SDL_CONTROLLER_BUTTON_MAX &&
@@ -98,12 +109,11 @@ bool assist_pad_down(SDL_GameController* controller, int binding) {
 }
 
 // ── MC-WS-002 present-cadence ring ───────────────────────────────────────
-// Always-on (Release too) ring recording EVERY SDL_RenderPresent from window
-// open: wall time blocked inside the call, entry-to-entry gap, and the DWM
-// composition refresh counter (cRefresh) at exit — the scanout-side ruler
-// that delivered-content framedumps cannot see. The ring records
-// unconditionally (~24 B/present); GBARECOMP_PRESENT_CADENCE=1 adds a
-// periodic stderr summary and a full CSV dump at close
+// Opt-in ring recording EVERY SDL_RenderPresent from window open: wall time
+// blocked inside the call, entry-to-entry gap, and the DWM composition refresh
+// counter (cRefresh) at exit -- the scanout-side ruler delivered-content
+// framedumps cannot see. GBARECOMP_PRESENT_CADENCE=1 enables the ring,
+// periodic stderr summaries, and a full CSV dump at close
 // (GBARECOMP_PRESENT_CADENCE_DUMP=path overrides ./_present_cadence.csv).
 // Interpretation (tools/analyze_present_cadence.py automates this):
 //   block_us ≈ 0 on every present → vsync is NOT blocking (tear-prone);
@@ -133,10 +143,11 @@ struct PresentCadence {
 #endif
 
     void init() {
-        ring.resize(kCadenceRingSize);
-        qpc_freq = SDL_GetPerformanceFrequency();
         const char* e = std::getenv("GBARECOMP_PRESENT_CADENCE");
         verbose = e && *e && *e != '0';
+        if (!verbose) return;
+        ring.resize(kCadenceRingSize);
+        qpc_freq = SDL_GetPerformanceFrequency();
         const char* d = std::getenv("GBARECOMP_PRESENT_CADENCE_DUMP");
         dump_path = (d && *d) ? d : "_present_cadence.csv";
 #if defined(_WIN32)
@@ -148,7 +159,9 @@ struct PresentCadence {
 #endif
     }
 
-    // Query the always-on DWM composition clock: refresh counter now, and
+    bool active() const { return verbose; }
+
+    // Query the DWM composition clock: refresh counter now, and
     // (optionally) the compositor's nominal refresh rate in Hz.
     uint64_t dwm_refresh_now(double* rate_hz) {
 #if defined(_WIN32)
@@ -176,6 +189,7 @@ struct PresentCadence {
     }
 
     void record(uint64_t qpc0, uint64_t qpc1, bool fullscreen) {
+        if (!verbose) return;
         PresentSample s;
         s.qpc = qpc0;
         s.block_us = to_us(qpc1 - qpc0);
@@ -304,6 +318,8 @@ struct Backend {
     int           sharp_texture_h = 0;
     bool          sharp_target_failed = false;
     SDL_AudioDeviceID audio_dev = 0;
+    bool audio_enabled = true;
+    bool game_paused = false;
     SDL_GameController* controller = nullptr;
     SDL_JoystickID      controller_id = -1;
     bool                controller_gyro = false;
@@ -366,6 +382,7 @@ struct Backend {
     // GBA KEYINPUT bit (0..9) per bound SDL scancode; seeded from the
     // built-in defaults, overridden by keybinds.ini [player1].
     SDL_Scancode bind_sc[10] = {};      // indexed by GBA KEYINPUT bit
+    int bind_pad[10] = {1, 2, 5, 7, 15, 14, 12, 13, 11, 10};
     HotkeyBind   hotkeys[HK_COUNT];     // [KeyMap] bindings
     SDL_Scancode assist_key[2] = {
         SDL_SCANCODE_1, SDL_SCANCODE_2
@@ -387,7 +404,7 @@ struct Backend {
     std::string  title;                 // base window title (readout restores it)
     Uint32       fps_window_start = 0;
     int          fps_presents = 0;
-    // MC-WS-002: always-on per-present timing/scanout ring (see above).
+    // MC-WS-002: opt-in per-present timing/scanout ring (see above).
     PresentCadence cadence;
 };
 
@@ -935,7 +952,7 @@ void runtime_imgui_shutdown(Backend* b) {
 
 void runtime_imgui_render(Backend* b) {
     if (!b->runtime_imgui_ready || !b->runtime_ui ||
-        !recomp_runtime_ui_is_open(b->runtime_ui)) {
+        (!recomp_runtime_ui_is_open(b->runtime_ui) && !b->game_paused)) {
         return;
     }
     ImGui::SetCurrentContext(b->runtime_imgui_context);
@@ -954,7 +971,8 @@ void runtime_imgui_render(Backend* b) {
     ImGui_ImplSDLRenderer2_NewFrame();
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
-    recomp_runtime_ui_render_imgui(b->runtime_ui);
+    if (recomp_runtime_ui_is_open(b->runtime_ui)) recomp_runtime_ui_render_imgui(b->runtime_ui);
+    else if (b->game_paused) recomp_runtime_ui_render_paused_imgui(b->runtime_ui);
     ImGui::Render();
     ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), b->renderer);
 
@@ -965,7 +983,7 @@ void runtime_imgui_render(Backend* b) {
 bool runtime_ui_event(RecompRuntimeUi* ui, const SDL_Event& e) {
     if (!ui) return false;
     if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_ESCAPE &&
-        !recomp_runtime_ui_is_open(ui)) {
+        !e.key.repeat && !recomp_runtime_ui_is_open(ui)) {
         recomp_runtime_ui_open(ui);
         return true;
     }
@@ -1002,10 +1020,7 @@ bool runtime_ui_event(RecompRuntimeUi* ui, const SDL_Event& e) {
     } else {
         switch (e.cbutton.button) {
             case SDL_CONTROLLER_BUTTON_GUIDE:
-                if (pressed) {
-                    if (recomp_runtime_ui_is_open(ui)) recomp_runtime_ui_close(ui);
-                    else recomp_runtime_ui_open(ui);
-                }
+                recomp_runtime_ui_handle_input(ui, RECOMP_RUNTIME_UI_INPUT_TOGGLE, pressed, 0);
                 return true;
             case SDL_CONTROLLER_BUTTON_DPAD_UP: input = RECOMP_RUNTIME_UI_INPUT_UP; break;
             case SDL_CONTROLLER_BUTTON_DPAD_DOWN: input = RECOMP_RUNTIME_UI_INPUT_DOWN; break;
@@ -1318,7 +1333,7 @@ uint64_t overlay_game_thread_compile_ns();
 void HostWindow::push_audio_samples(const int16_t* samples, std::size_t count) {
     if (!open_ || !impl_ || !samples || count == 0) return;
     auto* b = static_cast<Backend*>(impl_);
-    if (b->audio_dev == 0) return;
+    if (b->audio_dev == 0 || !b->audio_enabled || b->game_paused) return;
 
     // Volume (launcher setting + VolumeUp/Down hotkeys): scale into scratch
     // before the bridge. 100 = passthrough, byte-identical to before.
@@ -1647,14 +1662,18 @@ void HostWindow::present(const uint8_t* rgb888) {
     runtime_imgui_render(b);
 #endif
     // MC-WS-002: time the present itself (vsync blocks here — or doesn't)
-    // and stamp the DWM refresh counter into the always-on cadence ring.
-    const uint64_t cad_qpc0 = SDL_GetPerformanceCounter();
-    SDL_RenderPresent(b->renderer);
-    b->cadence.record(cad_qpc0, SDL_GetPerformanceCounter(), b->fullscreen);
+    // and stamp the DWM refresh counter into the cadence ring.
+    if (b->cadence.active()) {
+        const uint64_t cad_qpc0 = SDL_GetPerformanceCounter();
+        SDL_RenderPresent(b->renderer);
+        b->cadence.record(cad_qpc0, SDL_GetPerformanceCounter(), b->fullscreen);
+    } else {
+        SDL_RenderPresent(b->renderer);
+    }
 
     // FPS readout (DisplayPerf hotkey): presents/sec, refreshed twice a
     // second in the title bar; the base title is restored when toggled off.
-    if (b->fps_readout) {
+    if (b->fps_readout && !b->game_paused) {
         ++b->fps_presents;
         const Uint32 now = SDL_GetTicks();
         if (b->fps_window_start == 0) b->fps_window_start = now;
@@ -1672,16 +1691,23 @@ void HostWindow::present(const uint8_t* rgb888) {
 
 void HostWindow::load_input_config(const char* dir,
                                    bool assist_tools_default,
-                                   int fast_forward_multiplier_default) {
+                                   int fast_forward_multiplier_default,
+                                   const char* config_filename,
+                                   const char* keybinds_filename) {
     if (!open_ || !impl_ || !dir) return;
     auto* b = static_cast<Backend*>(impl_);
     b->assist_tools = assist_tools_default;
     b->assist_fast_forward_multiplier = std::clamp(
         fast_forward_multiplier_default, 2, 10);
-    const std::string base = std::string(dir) + "/";
+    const auto input_path = [&](const char* name, const char* fallback) {
+        const std::filesystem::path p(name && *name ? name : fallback);
+        return (p.is_absolute() ? p : std::filesystem::path(dir) / p).string();
+    };
+    const auto config_path = input_path(config_filename, "config.ini");
+    const auto keybinds_path = input_path(keybinds_filename, "keybinds.ini");
 
     // keybinds.ini [player1] (recomp-ui generic format, scancode names).
-    ini_scan_section((base + "keybinds.ini").c_str(), "player1",
+    ini_scan_section(keybinds_path.c_str(), "player1",
                      [b](const char* key, const char* val) {
         for (const auto& bk : kBindKeys) {
             if (SDL_strcasecmp(key, bk.name) != 0) continue;
@@ -1692,7 +1718,7 @@ void HostWindow::load_input_config(const char* dir,
     });
 
     // config.ini [KeyMap] (keycode names with Ctrl+/Alt+/Shift+ prefixes).
-    ini_scan_section((base + "config.ini").c_str(), "KeyMap",
+    ini_scan_section(config_path.c_str(), "KeyMap",
                      [b](const char* key, const char* val) {
         for (int h = 0; h < HK_COUNT; ++h) {
             if (SDL_strcasecmp(key, kHotkeyNames[h]) != 0) continue;
@@ -1705,8 +1731,16 @@ void HostWindow::load_input_config(const char* dir,
     // scancodes; controller values use recomp-ui's portable button/axis
     // encoding. Keeping these in [Launcher] lets the pre-boot menu and the
     // runtime share one configuration file.
-    ini_scan_section((base + "config.ini").c_str(), "Launcher",
+    ini_scan_section(config_path.c_str(), "Launcher",
                      [b](const char* key, const char* val) {
+        int index = -1;
+        if (std::sscanf(key, "player_key_%d", &index) == 1 && index >= 0 && index < 10) {
+            const int value = std::atoi(val);
+            b->bind_sc[index] = static_cast<SDL_Scancode>(
+                value >= 0 && value < SDL_NUM_SCANCODES ? value : 0);
+        }
+        if (std::sscanf(key, "player_pad_%d", &index) == 1 && index >= 0 && index < 10)
+            b->bind_pad[index] = std::atoi(val);
         if (SDL_strcasecmp(key, "assist_tools") == 0)
             b->assist_tools = std::atoi(val) != 0;
         else if (SDL_strcasecmp(key, "assist_fast_forward_multiplier") == 0)
@@ -1821,13 +1855,25 @@ bool HostWindow::linear_filter() const {
 void HostWindow::set_audio_enabled(bool enabled) {
     if (!open_ || !impl_) return;
     auto* b = static_cast<Backend*>(impl_);
-    if (b->audio_dev) SDL_PauseAudioDevice(b->audio_dev, enabled ? 0 : 1);
+    b->audio_enabled = enabled;
+    if (b->audio_dev) SDL_PauseAudioDevice(b->audio_dev, enabled && !b->game_paused ? 0 : 1);
+}
+
+void HostWindow::set_game_paused(bool paused) {
+    if (!open_ || !impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+    b->game_paused = paused;
+    if (b->audio_dev) SDL_PauseAudioDevice(b->audio_dev, paused || !b->audio_enabled ? 1 : 0);
+    b->fps_window_start = 0;
+    b->fps_presents = 0;
+    const std::string title = b->title + (paused ? " - Paused (Esc: menu)" : "");
+    SDL_SetWindowTitle(b->window, title.c_str());
 }
 
 bool HostWindow::audio_enabled() const {
     if (!open_ || !impl_) return false;
     auto* b = static_cast<const Backend*>(impl_);
-    return b->audio_dev && SDL_GetAudioDeviceStatus(b->audio_dev) == SDL_AUDIO_PLAYING;
+    return b->audio_dev && b->audio_enabled;
 }
 
 void HostWindow::set_resize_driven_view(bool enabled) {
@@ -1969,7 +2015,8 @@ HostWindow::Events HostWindow::pump() {
                 ev.toggle_pause = true;
             } else if (visible_debugger && sym == SDLK_F9) {
                 ev.debug_step_frame = true;
-            } else if (visible_debugger && sym == SDLK_F10) {
+            } else if (sym == SDLK_F10 &&
+                       (visible_debugger || std::getenv("GBARECOMP_DEBUG_CAPTURE_DIR"))) {
                 ev.debug_export = true;
             } else if (sym >= SDLK_F1 && sym <= SDLK_F9) {
                 int slot = static_cast<int>(sym - SDLK_F1) + 1;
@@ -2040,24 +2087,9 @@ HostWindow::Events HostWindow::pump() {
     // inputs. Keyboard and controller are additive so either can be used at
     // any time, including while testing motion.
     if (b->controller && SDL_GameControllerGetAttached(b->controller)) {
-        const struct {
-            int bit;
-            SDL_GameControllerButton button;
-        } pad_map[] = {
-            {0, SDL_CONTROLLER_BUTTON_A},
-            {1, SDL_CONTROLLER_BUTTON_B},
-            {2, SDL_CONTROLLER_BUTTON_BACK},
-            {3, SDL_CONTROLLER_BUTTON_START},
-            {4, SDL_CONTROLLER_BUTTON_DPAD_RIGHT},
-            {5, SDL_CONTROLLER_BUTTON_DPAD_LEFT},
-            {6, SDL_CONTROLLER_BUTTON_DPAD_UP},
-            {7, SDL_CONTROLLER_BUTTON_DPAD_DOWN},
-            {8, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER},
-            {9, SDL_CONTROLLER_BUTTON_LEFTSHOULDER},
-        };
-        for (const auto& binding : pad_map) {
-            if (SDL_GameControllerGetButton(b->controller, binding.button))
-                keys &= static_cast<uint16_t>(~(1u << binding.bit));
+        for (int bit = 0; bit < 10; ++bit) {
+            if (assist_pad_down(b->controller, b->bind_pad[bit]))
+                keys &= static_cast<uint16_t>(~(1u << bit));
         }
     }
     if (b->touch_controls) {
@@ -2185,7 +2217,9 @@ void HostWindow::present(const uint8_t* /*rgb888*/) {}
 
 void HostWindow::load_input_config(const char* /*dir*/,
                                    bool /*assist_tools_default*/,
-                                   int /*fast_forward_multiplier_default*/) {}
+                                   int /*fast_forward_multiplier_default*/,
+                                   const char* /*config_filename*/,
+                                   const char* /*keybinds_filename*/) {}
 void HostWindow::set_fullscreen(int /*mode*/) {}
 int  HostWindow::fullscreen() const { return 0; }
 void HostWindow::adjust_scale(int /*delta*/) {}
@@ -2195,6 +2229,7 @@ int  HostWindow::window_scale() const { return 1; }
 void HostWindow::set_linear_filter(bool /*enabled*/) {}
 bool HostWindow::linear_filter() const { return false; }
 void HostWindow::set_audio_enabled(bool /*enabled*/) {}
+void HostWindow::set_game_paused(bool /*paused*/) {}
 bool HostWindow::audio_enabled() const { return false; }
 void HostWindow::set_resize_driven_view(bool /*enabled*/) {}
 #if defined(GBARECOMP_RUNTIME_UI)

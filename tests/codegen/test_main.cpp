@@ -460,6 +460,19 @@ bool run_thumb_alu_immediate_override_cases() {
 }  // namespace
 
 int main() {
+    // Both modes must retain guest registers while changing only trace history.
+    runtime_trace_reset();
+    const unsigned original_trace_enabled = g_runtime_trace_enabled;
+    RuntimeTraceEntry trace_entry{};
+    g_runtime_trace_enabled = 0;
+    runtime_trace_event(RUNTIME_TRACE_DISPATCH, 0x08000100u, 0, 0, 0);
+    if (runtime_trace_copy_recent(&trace_entry, 1) != 0) return 3;
+    g_runtime_trace_enabled = 1;
+    runtime_trace_event(RUNTIME_TRACE_DISPATCH, 0x08000102u, 0, 0, 0);
+    if (runtime_trace_copy_recent(&trace_entry, 1) != 1 ||
+        trace_entry.pc != 0x08000102u) return 4;
+    runtime_trace_reset();
+    g_runtime_trace_enabled = original_trace_enabled;
     std::printf("codegen_tests: %zu cases\n", kTestCasesCount);
     if (kTestCasesCount != kTestFnsCount) {
         std::printf("FAIL: corpus size (%zu) != generated fn count (%u)\n",

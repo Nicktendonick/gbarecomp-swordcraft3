@@ -37,6 +37,7 @@
 #if defined(RECOMP_LAUNCHER)
 
 #include "runtime.h"
+#include "portable_files.h"
 #include "../gba/gba_bios.h"
 #if defined(GBARECOMP_ENABLE_MODS)
 #include "mod_runtime.h"
@@ -317,6 +318,10 @@ inline std::string toml_path_value(const std::string& toml_path,
 
 // Launcher-owned persisted settings (config.ini [Launcher]).
 struct SeamConfig {
+    // KEYINPUT bit order, shared with HostWindow. SDL scancodes and encoded pads.
+    int player_key[10] = {27,29,229,40,79,80,82,81,25,6};
+    int player_pad[10] = {1,2,5,7,15,14,12,13,11,10};
+    bool player_bindings_declared = false; // legacy keybinds.ini remains authoritative otherwise
     int  scale = 3;
     int  fullscreen = 0;
     int  linear_filter = 0;
@@ -365,6 +370,15 @@ inline void seam_config_load(const std::string& path, SeamConfig* c) {
         };
         std::string key = trim(s.substr(0, eq));
         std::string val = trim(s.substr(eq + 1));
+        int index = -1;
+        if (std::sscanf(key.c_str(), "player_key_%d", &index) == 1 && index >= 0 && index < 10) {
+            c->player_key[index] = std::clamp(std::atoi(val.c_str()), 0, 511);
+            c->player_bindings_declared = true;
+        }
+        if (std::sscanf(key.c_str(), "player_pad_%d", &index) == 1 && index >= 0 && index < 10) {
+            c->player_pad[index] = std::atoi(val.c_str());
+            c->player_bindings_declared = true;
+        }
         if (key == "scale")         c->scale = std::atoi(val.c_str());
         else if (key == "fullscreen")    c->fullscreen = std::atoi(val.c_str());
         else if (key == "linear_filter") c->linear_filter = std::atoi(val.c_str());
@@ -433,6 +447,10 @@ inline void seam_config_save(const std::string& path, const SeamConfig& c) {
     for (const auto& l : kept) f << l << "\n";
     if (!kept.empty()) f << "\n";
     f << "[Launcher]\n";
+    for (int i = 0; c.player_bindings_declared && i < 10; ++i) {
+        f << "player_key_" << i << " = " << c.player_key[i] << "\n";
+        f << "player_pad_" << i << " = " << c.player_pad[i] << "\n";
+    }
     f << "scale = " << c.scale << "\n";
     f << "fullscreen = " << c.fullscreen << "\n";
     f << "linear_filter = " << c.linear_filter << "\n";
@@ -653,12 +671,13 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     if (headless || (skip_once && !force_launcher)) return 0;
 
     const std::string dir = exe_dir(args);
+    const std::string data_dir = opts.data_root && *opts.data_root ? opts.data_root : dir;
     const auto state_path = [&](const char* filename,
                                 const char* fallback) -> std::string {
         const char* chosen = (filename && filename[0]) ? filename : fallback;
         std::filesystem::path path(chosen);
         if (path.is_absolute()) return path.string();
-        return (std::filesystem::path(dir) / path).string();
+        return (std::filesystem::path(data_dir) / path).string();
     };
     const std::string config_path =
         state_path(opts.launcher_config_filename, "config.ini");
@@ -671,7 +690,7 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
         opts.builtin_rom_sha1 && *opts.builtin_rom_sha1) {
         std::string mod_error;
         if (gbarecomp::mod_runtime_initialize(
-                std::filesystem::path(dir) / "mods",
+                std::filesystem::path(data_dir) / (opts.data_root ? "Mods" : "mods"),
                 opts.mod_game_id, opts.builtin_rom_sha1, &mod_error)) {
             mod_provider = gbarecomp::mod_runtime_launcher_provider();
         } else {
@@ -683,6 +702,11 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
 
     SeamConfig cfg;
     seam_config_load(config_path, &cfg);
+    if (opts.data_root && !cfg.rom_patch_path.empty()) {
+        std::filesystem::path patch(cfg.rom_patch_path);
+        if (patch.is_relative())
+            cfg.rom_patch_path = (std::filesystem::path(config_path).parent_path() / patch).lexically_normal().string();
+    }
     if (cfg.sharp_filter < 0)
         cfg.sharp_filter = opts.launcher_default_sharp_filter ? 1 : 0;
     if (cfg.affine_filter < 0)
@@ -725,6 +749,20 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
         };
     seed_rom = normalize_cached_path(seed_rom, rom_cfg);
     seed_bios = normalize_cached_path(seed_bios, bios_cfg);
+    if (opts.data_root) {
+        try {
+            if (!seed_bios.empty())
+                seed_bios = gbarecomp::portable_import(data_dir, "BIOS", seed_bios).string();
+            if (!cfg.rom_patch_path.empty() && !std::filesystem::is_regular_file(cfg.rom_patch_path)) {
+                cfg.rom_patch_path.clear(); cfg.rom_patch_enabled = 0;
+            }
+            if (!cfg.rom_patch_path.empty())
+                cfg.rom_patch_path = gbarecomp::portable_import(data_dir, "Mods", cfg.rom_patch_path).string();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[launcher] portable import failed: %s\n", e.what());
+            return 1;
+        }
+    }
     if ((seed_rom.empty() || seed_bios.empty()) &&
         opts.launcher_game_config && opts.launcher_game_config[0]) {
         // Packaged builds put game.toml beside the executable. Development
@@ -769,6 +807,13 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     ls.audio_freq    = 32768;             // GBA mixer base rate (display only)
     ls.volume        = cfg.volume;
     ls.player_src[0] = 1;                 // keyboard (gbarecomp host input)
+    static constexpr int spec_to_bit[10] = {6,7,5,4,0,1,9,8,3,2};
+    RecompLauncherCSettings defaults{};
+    const SeamConfig binding_defaults;
+    for (int i = 0; i < 10; ++i) {
+        ls.player_key_bind[0][i] = cfg.player_key[spec_to_bit[i]];
+        ls.player_pad_bind[0][i] = cfg.player_pad[spec_to_bit[i]];
+    }
     ls.skip_launcher = cfg.skip_launcher;
     bool solar_in_launcher = false;
     if (opts.has_solar_sensor) solar_in_launcher = push_solar_settings(ls, solar);
@@ -788,11 +833,23 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     gbarecomp_seam::set_presentation_filters(
         ls, cfg.sharp_filter != 0, cfg.affine_filter != 0);
     std::snprintf(ls.bios_path, sizeof(ls.bios_path), "%s", seed_bios.c_str());
+    defaults = ls;
+    defaults.window_scale = 3; defaults.fullscreen = 0; defaults.volume = 100;
+    defaults.linear_filter = 0; defaults.screen_kind = 0;
+    defaults.widescreen = 0; defaults.adaptive_view = 0; defaults.aspect_index = 0;
+    defaults.skip_launcher = 0;
+    set_gyro_sensitivity(defaults, 1.0f);
+    set_presentation_filters(defaults, opts.launcher_default_sharp_filter,
+                             opts.launcher_default_affine_filter);
+    for (int i = 0; i < 10; ++i) {
+        defaults.player_key_bind[0][i] = binding_defaults.player_key[spec_to_bit[i]];
+        defaults.player_pad_bind[0][i] = binding_defaults.player_pad[spec_to_bit[i]];
+    }
 
     std::string rom_patch_cache_dir;
     if (opts.launcher_enable_rom_patches) {
         const std::filesystem::path cache =
-            std::filesystem::path(dir) / "mods" / "rom-patches";
+            std::filesystem::path(data_dir) / (opts.data_root ? "Mods" : "mods") / "rom-patches";
         std::error_code cache_error;
         std::filesystem::create_directories(cache, cache_error);
         if (!cache_error) rom_patch_cache_dir = cache.string();
@@ -810,13 +867,17 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     // SAME fingerprint so its "verified" check agrees with the runtime (a
     // CRC32 is dump-specific and would reject other valid dumps). CRC32, when
     // present, stays informational only.
-    const char* sha1_one[1];
+    const char* sha1_one[2];
     const char* launcher_source_sha1 = opts.launcher_source_rom_sha1
         ? opts.launcher_source_rom_sha1 : opts.builtin_rom_sha1;
     if (launcher_source_sha1 && launcher_source_sha1[0]) {
         sha1_one[0] = launcher_source_sha1;
         gi.known_sha1_hex = sha1_one;
         gi.num_known_sha1 = 1;
+        if (opts.launcher_required_patch_sha1) {
+            sha1_one[1] = opts.launcher_required_patch_sha1;
+            gi.num_known_sha1 = 2; // also permit an already prepared target image
+        }
     }
     gi.widescreen_supported = opts.launcher_expose_widescreen &&
         opts.widescreen_view_width > 240 ? 1 : 0;
@@ -841,6 +902,33 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
         "without the normal frame limiter. Keyboard and controller controls "
         "can be changed below.";
     gi.settings_bindings = opts.expose_assist_tools ? 1 : 0;
+    gi.hybrid_input = opts.launcher_hybrid_input;
+    gi.default_settings = &defaults;
+    defaults.assist_tools = opts.assist_tools_enabled_by_default;
+    defaults.assist_fast_forward_multiplier = opts.assist_fast_forward_multiplier_default;
+    for (int i=0;i<2;++i) {
+        defaults.assist_key_bind[i] = kAssistDefaultKeys[i];
+        defaults.assist_pad_bind[i] = kAssistDefaultPads[i];
+    }
+    gi.battery_save_size = opts.launcher_battery_save_size;
+    std::string states_note = std::to_string(opts.save_state_slot_count) +
+        " slots are available in the in-game menu (Escape), under Assist Tools. "
+        "Save and load there after starting the game. F1-F9 load slots 1-9; "
+        "Shift+F1-F9 save them. Save states are separate from the battery save. "
+        "Rewind history is temporary and resets when you close the game.";
+    if (opts.expose_assist_tools) gi.save_states_note = states_note.c_str();
+    gi.import_file_ctx = opts.data_root ? const_cast<char*>(opts.data_root) : nullptr;
+    if (opts.data_root) gi.import_file = [](void* ctx, const char* kind,
+            const char* source, char* result, size_t cap, char* error, size_t error_cap) {
+        try {
+            const auto target = gbarecomp::portable_import(static_cast<const char*>(ctx), kind, source).string();
+            if (target.size() >= cap) throw std::runtime_error("Imported path is too long.");
+            std::snprintf(result, cap, "%s", target.c_str());
+            return 1;
+        } catch (const std::exception& e) {
+            std::snprintf(error, error_cap, "%s", e.what()); return 0;
+        }
+    };
     gi.assist_binding_labels = kAssistBindings;
     gi.assist_binding_count = opts.expose_assist_tools ? 2 : 0;
     gi.assist_default_key_bind = kAssistDefaultKeys;
@@ -848,6 +936,17 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     gi.assist_fast_forward_min = 2;
     gi.assist_fast_forward_max = 10;
     gi.boxart_path = opts.launcher_boxart;   // NULL => default assets/img/boxart.tga
+    if (opts.launcher_theme && opts.launcher_theme[0]) gi.theme = opts.launcher_theme;
+    gi.logo_path = opts.launcher_logo;
+    gi.backdrop_path = opts.launcher_backdrop;
+    gi.tagline = opts.launcher_tagline;
+    gi.sidebar_layout = opts.launcher_sidebar;
+    gi.settings_note = opts.launcher_settings_note;
+    gi.credits_text = opts.launcher_credits_text;
+    gi.credits_title = opts.launcher_credits_title;
+    gi.credits_secondary_text = opts.launcher_credits_secondary_text;
+    gi.credits_secondary_title = opts.launcher_credits_secondary_title;
+    gi.credits_tools_text = opts.launcher_credits_tools_text;
     gi.bios_verify = &gbarecomp_seam::verify_retail_gba_bios;
     gi.rom_patch_supported =
         opts.launcher_enable_rom_patches && !rom_patch_cache_dir.empty();
@@ -874,12 +973,14 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     // else the runtime's <rom>.sav convention derived from the seeded ROM.
     std::string save_display;
     if (opts.launcher_save_path && opts.launcher_save_path[0]) {
-        save_display = opts.launcher_save_path;
+        save_display = state_path(opts.launcher_save_path, "");
     } else if (!seed_rom.empty()) {
         std::filesystem::path p(seed_rom);
         p.replace_extension(".sav");
         save_display = p.string();
     }
+    for (size_t i = 1; i + 1 < args.size(); ++i)
+        if (args[i] == "--save") save_display = std::filesystem::absolute(args[i+1]).string();
     if (!save_display.empty()) gi.sram_path = save_display.c_str();
 
     std::string title = std::string(gi.name) + " \xE2\x80\x94 Launcher";
@@ -888,8 +989,8 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     int rc = recomp_launcher_run_window(title.c_str(), &ls, &gi, dir.c_str(),
                                         seed_rom.c_str(),
                                         picked_rom, sizeof(picked_rom));
-    if (rc == 1) return 1;    // user closed the launcher: quit without booting
-    if (rc != 0) return 0;    // unavailable: fall back to the asset picker
+    if (rc == 1 && !opts.launcher_hybrid_input) return 1;
+    if (rc != 0 && rc != 1) return 1; // fail closed; do not bypass the launcher
 
     // ---- persist + translate the committed settings -------------------------
     cfg.scale         = ls.window_scale > 0 ? ls.window_scale : cfg.scale;
@@ -926,6 +1027,13 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     cfg.assist_fast_pad = ls.assist_pad_bind[1];
     cfg.rom_patch_enabled = ls.rom_patch_enabled ? 1 : 0;
     cfg.rom_patch_path = ls.rom_patch_path;
+    if (opts.data_root && !cfg.rom_patch_path.empty())
+        cfg.rom_patch_path = gbarecomp::portable_reference(cfg.rom_patch_path, config_path);
+    if (opts.launcher_hybrid_input) cfg.player_bindings_declared = true;
+    for (int i = 0; i < 10; ++i) {
+        cfg.player_key[spec_to_bit[i]] = ls.player_key_bind[0][i];
+        cfg.player_pad[spec_to_bit[i]] = ls.player_pad_bind[0][i];
+    }
     seam_config_save(config_path, cfg);
     // Only rewrite [Solar] when this recomp-ui pin actually surfaced the panel;
     // otherwise the values never round-tripped through it and writing them back
@@ -947,14 +1055,20 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
         // Persist the pick NOW (not only after a successful boot) so the next
         // launch prefills instead of re-prompting — the whole point of the
         // launcher remembering. Mirrors the runtime asset picker's cache.
-        write_single_line(rom_cfg,
-            ls.rom_patch_source_path[0]
-                ? ls.rom_patch_source_path : picked_rom);
+        const std::string selected = ls.rom_patch_source_path[0] ? ls.rom_patch_source_path : picked_rom;
+        write_single_line(rom_cfg, opts.data_root
+            ? gbarecomp::portable_reference(selected, rom_cfg) : selected);
     }
     if (ls.bios_path[0]) {
         args.push_back("--bios");
         args.push_back(ls.bios_path);
-        write_single_line(bios_cfg, ls.bios_path);
+        write_single_line(bios_cfg, opts.data_root
+            ? gbarecomp::portable_reference(ls.bios_path, bios_cfg) : ls.bios_path);
+    }
+    if (rc == 1) return 1;
+    if (!save_display.empty() && ((opts.launcher_save_path && *opts.launcher_save_path) ||
+            std::find(args.begin(), args.end(), "--save") != args.end())) {
+        args.push_back("--save"); args.push_back(save_display);
     }
     seam_append_setting_args(args, cfg, opts);
     return 0;

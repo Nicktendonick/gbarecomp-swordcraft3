@@ -69,7 +69,9 @@ public:
     // files don't exist.
     void load_input_config(const char* dir,
                            bool assist_tools_default = true,
-                           int fast_forward_multiplier_default = 4);
+                           int fast_forward_multiplier_default = 4,
+                           const char* config_filename = nullptr,
+                           const char* keybinds_filename = nullptr);
 
     // Live window/audio controls (hotkey + launcher-driven). All no-ops when
     // the window isn't open or this build has no SDL2.
@@ -85,6 +87,7 @@ public:
     void set_linear_filter(bool enabled);
     bool linear_filter() const;
     void set_audio_enabled(bool enabled);
+    void set_game_paused(bool paused);
     bool audio_enabled() const;
     void set_resize_driven_view(bool enabled);
 #if defined(GBARECOMP_RUNTIME_UI)

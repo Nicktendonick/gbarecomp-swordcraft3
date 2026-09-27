@@ -173,6 +173,16 @@ struct RunOptions {
     // near-full-screen panels, larger hit targets, and touch-oriented footer
     // copy. False preserves the desktop/TV presentation for existing games.
     bool ui_touch_friendly = false;
+    const char* ui_theme = "gba";
+    const char* ui_title = nullptr;
+    const char* ui_subtitle = nullptr;
+    bool ui_session_controls = false;
+    bool ui_pause_on_open = false;
+    // Optional file relative to data_root (or executable folder), not AppData.
+    const char* ui_preferences_filename = nullptr;
+    // A supervisor may opt into clean process restart. Returned ONLY after
+    // normal shutdown and a successful battery-save flush. Zero disables it.
+    int ui_reset_exit_code = 0;
 
     // Game/device calibration beneath the user-facing gyro multiplier.
     // A menu value of 1.00x means this game's authored baseline; 0.75 here
@@ -195,6 +205,18 @@ struct RunOptions {
     const char* launcher_keybinds_filename = nullptr;
     const char* launcher_rom_cache_filename = nullptr;
     const char* launcher_bios_cache_filename = nullptr;
+    // Optional portable data root, distinct from the executable/assets folder.
+    // Relative launcher paths and runtime input files resolve here. The host
+    // creates it; no AppData fallback is performed.
+    const char* data_root = nullptr;
+    const char* save_state_basename = nullptr; // absolute or relative to data_root
+    bool launcher_hybrid_input = false;
+    const char* launcher_credits_text = nullptr;
+    const char* launcher_credits_title = nullptr;
+    const char* launcher_credits_secondary_text = nullptr;
+    const char* launcher_credits_secondary_title = nullptr;
+    const char* launcher_credits_tools_text = nullptr;
+    std::size_t launcher_battery_save_size = 0;
     const char* launcher_save_path = nullptr;   // explicit save file (game.toml
                                                 // [save].path); null => <rom>.sav
                                                 // derived from the seeded ROM
@@ -247,6 +269,12 @@ struct RunOptions {
     // null => the launcher's default "assets/img/boxart.tga". Multi-variant
     // repos stage one file per variant (e.g. "assets/img/boxart_firered.tga").
     const char* launcher_boxart = nullptr;
+    const char* launcher_theme = nullptr;
+    const char* launcher_logo = nullptr;
+    const char* launcher_backdrop = nullptr;
+    const char* launcher_tagline = nullptr;
+    bool launcher_sidebar = false;
+    const char* launcher_settings_note = nullptr;
 };
 
 int run_game(int argc, char** argv, const RunOptions& opts = {});
