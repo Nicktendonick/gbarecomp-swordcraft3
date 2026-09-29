@@ -38,6 +38,7 @@
 
 #include "runtime.h"
 #include "portable_files.h"
+#include "presentation_preferences.h"
 #include "../gba/gba_bios.h"
 #if defined(GBARECOMP_ENABLE_MODS)
 #include "mod_runtime.h"
@@ -174,6 +175,60 @@ inline void set_presentation_filter_caps(T& game_info,
         game_info.has_sharp_filter = sharp ? 1 : 0;
         game_info.has_affine_filter = affine ? 1 : 0;
     }
+}
+
+// Keep these additive fields optional for hosts using an older recomp-ui pin.
+template <typename T, typename = void>
+struct has_extra_presentation_filters : std::false_type {};
+
+template <typename T>
+struct has_extra_presentation_filters<T,
+    std::void_t<decltype(std::declval<T&>().smooth_filter),
+                decltype(std::declval<T&>().screen_effect),
+                decltype(std::declval<T&>().screen_effect_strength)>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct has_extra_presentation_filter_caps : std::false_type {};
+
+template <typename T>
+struct has_extra_presentation_filter_caps<T,
+    std::void_t<decltype(std::declval<T&>().has_smooth_filter),
+                decltype(std::declval<T&>().has_screen_effects)>>
+    : std::true_type {};
+
+template <typename T>
+inline void set_extra_presentation_filters(T& settings, int smooth,
+                                           int effect, int strength) {
+    if constexpr (has_extra_presentation_filters<T>::value) {
+        settings.smooth_filter = smooth == 1 ? 1 : 0;
+        settings.screen_effect = effect >= 0 && effect <= 2 ? effect : 0;
+        settings.screen_effect_strength = std::clamp(strength, 0, 100);
+    }
+}
+
+template <typename T>
+inline void get_extra_presentation_filters(const T& settings, int& smooth,
+                                           int& effect, int& strength) {
+    if constexpr (has_extra_presentation_filters<T>::value) {
+        smooth = settings.smooth_filter == 1 ? 1 : 0;
+        effect = settings.screen_effect >= 0 && settings.screen_effect <= 2
+            ? settings.screen_effect : 0;
+        strength = std::clamp(settings.screen_effect_strength, 0, 100);
+    }
+}
+
+template <typename T>
+inline void set_extra_presentation_filter_caps(T& game_info, bool smooth,
+                                                bool effects) {
+    if constexpr (has_extra_presentation_filter_caps<T>::value) {
+        game_info.has_smooth_filter = smooth ? 1 : 0;
+        game_info.has_screen_effects = effects ? 1 : 0;
+    }
+}
+
+inline const char* screen_effect_token(int effect) {
+    return effect == 1 ? "lcd" : effect == 2 ? "crt" : "off";
 }
 
 // Same treatment for the solar-sensor fields, so this header still compiles
@@ -327,11 +382,15 @@ struct SeamConfig {
     int  linear_filter = 0;
     int  sharp_filter = -1;
     int  affine_filter = -1;
+    int  smooth_filter = 0;
+    int  screen_effect = 0;   // 0 off, 1 LCD grid, 2 CRT
+    int  screen_effect_strength = 35;
     int  screen_kind = 0;      // kScreenTokens index
     int  volume = 100;
     int  skip_launcher = 0;
     int  widescreen = 0;       // legacy fixed-width toggle
     int  aspect_index = 0;     // games with a launcher_aspect vocabulary only
+    int  host_aspect_index = -1; // independent of obsolete hidden PPU-view settings
     int  adaptive_view = 0;    // live drawable aspect; fixed aspect is retained
     float gyro_sensitivity = 1.00f;
     int  assist_tools = -1;      // unset -> game's requested default
@@ -349,7 +408,11 @@ inline void seam_config_load(const std::string& path, SeamConfig* c) {
     if (!f) return;
     std::string line;
     bool in_section = false;
+    bool first_line = true;
     while (std::getline(f, line)) {
+        if (first_line && line.compare(0, 3, "\xef\xbb\xbf") == 0)
+            line.erase(0, 3);
+        first_line = false;
         size_t b = line.find_first_not_of(" \t");
         if (b == std::string::npos) continue;
         size_t e = line.find_last_not_of(" \t\r\n");
@@ -384,6 +447,9 @@ inline void seam_config_load(const std::string& path, SeamConfig* c) {
         else if (key == "linear_filter") c->linear_filter = std::atoi(val.c_str());
         else if (key == "sharp_filter") c->sharp_filter = std::atoi(val.c_str());
         else if (key == "affine_filter") c->affine_filter = std::atoi(val.c_str());
+        else if (key == "smooth_filter") c->smooth_filter = std::atoi(val.c_str());
+        else if (key == "screen_effect") c->screen_effect = std::atoi(val.c_str());
+        else if (key == "screen_effect_strength") c->screen_effect_strength = std::atoi(val.c_str());
         else if (key == "screen")        c->screen_kind = screen_token_to_index(val);
         else if (key == "volume")        c->volume = std::atoi(val.c_str());
         else if (key == "skip_launcher") c->skip_launcher = std::atoi(val.c_str());
@@ -402,11 +468,20 @@ inline void seam_config_load(const std::string& path, SeamConfig* c) {
         else if (key == "rom_patch_enabled") c->rom_patch_enabled = std::atoi(val.c_str());
         else if (key == "rom_patch_path") c->rom_patch_path = val;
     }
+    // Use the same strict parser as the live menu/reset supervisor: garbage
+    // must not silently become the original-GBA preset through atoi("...").
+    c->host_aspect_index = gbarecomp::read_host_aspect_preference(path, 65536).value_or(-1);
     if (c->scale < 1) c->scale = 1;
     if (c->scale > 8) c->scale = 8;
     if (c->volume < 0) c->volume = 0;
     if (c->volume > 100) c->volume = 100;
     if (c->screen_kind < 0 || c->screen_kind > 4) c->screen_kind = 0;
+    c->smooth_filter = c->smooth_filter == 1 ? 1 : 0;
+    if (c->screen_effect < 0 || c->screen_effect > 2) c->screen_effect = 0;
+    c->screen_effect_strength = std::clamp(c->screen_effect_strength, 0, 100);
+    // Scalers are mutually exclusive, including skip-launcher sessions.
+    if (c->smooth_filter) c->linear_filter = c->sharp_filter = 0;
+    else if (c->linear_filter) c->sharp_filter = 0;
     // Tri-state: 0 off, 1 borderless, 2 exclusive. Guard against a hand-
     // edited/garbage config.ini value; do NOT collapse to a bool here.
     if (c->fullscreen < 0 || c->fullscreen > 2) c->fullscreen = 0;
@@ -421,10 +496,15 @@ inline void seam_config_load(const std::string& path, SeamConfig* c) {
 // line (notably [KeyMap], which the launcher's hotkey editor edits in place).
 inline void seam_config_save(const std::string& path, const SeamConfig& c) {
     std::vector<std::string> lines;
+    bool utf8_bom = false;
     {
         std::ifstream f(path);
         std::string line;
         while (std::getline(f, line)) {
+            if (lines.empty() && line.compare(0, 3, "\xef\xbb\xbf") == 0) {
+                utf8_bom = true;
+                line.erase(0, 3);
+            }
             while (!line.empty() && line.back() == '\r') line.pop_back();
             lines.push_back(line);
         }
@@ -444,6 +524,7 @@ inline void seam_config_save(const std::string& path, const SeamConfig& c) {
 
     std::ofstream f(path, std::ios::trunc);
     if (!f) return;
+    if (utf8_bom) f << "\xef\xbb\xbf";
     for (const auto& l : kept) f << l << "\n";
     if (!kept.empty()) f << "\n";
     f << "[Launcher]\n";
@@ -456,11 +537,15 @@ inline void seam_config_save(const std::string& path, const SeamConfig& c) {
     f << "linear_filter = " << c.linear_filter << "\n";
     f << "sharp_filter = " << c.sharp_filter << "\n";
     f << "affine_filter = " << c.affine_filter << "\n";
+    f << "smooth_filter = " << c.smooth_filter << "\n";
+    f << "screen_effect = " << c.screen_effect << "\n";
+    f << "screen_effect_strength = " << c.screen_effect_strength << "\n";
     f << "screen = " << kScreenTokens[c.screen_kind] << "\n";
     f << "volume = " << c.volume << "\n";
     f << "skip_launcher = " << c.skip_launcher << "\n";
     f << "widescreen = " << c.widescreen << "\n";
     f << "aspect_index = " << c.aspect_index << "\n";
+    if (c.host_aspect_index >= 0) f << "host_aspect_index = " << c.host_aspect_index << "\n";
     f << "adaptive_view = " << c.adaptive_view << "\n";
     f << "gyro_sensitivity = " << c.gyro_sensitivity << "\n";
     f << "assist_tools = " << c.assist_tools << "\n";
@@ -589,6 +674,16 @@ inline void seam_append_setting_args(std::vector<std::string>& args,
         args.push_back("--affine-filter");
         args.push_back(c.affine_filter ? "1" : "0");
     }
+    if (opts.launcher_expose_smooth_filter) {
+        args.push_back("--smooth-filter");
+        args.push_back(c.smooth_filter ? "1" : "0");
+    }
+    if (opts.launcher_expose_screen_effects) {
+        args.push_back("--screen-effect");
+        args.push_back(screen_effect_token(c.screen_effect));
+        args.push_back("--screen-effect-strength");
+        args.push_back(std::to_string(std::clamp(c.screen_effect_strength, 0, 100)));
+    }
     args.push_back("--screen");
     args.push_back(kScreenTokens[c.screen_kind]);
     // Tri-state: 0 off, 1 borderless, 2 exclusive. Pass the value explicitly
@@ -613,7 +708,12 @@ inline void seam_append_setting_args(std::vector<std::string>& args,
     // display supplies the aspect, so adaptive mode deliberately ignores the
     // stored fixed selection.
     const bool fixed_view_honored = !adaptive_view || !c.fullscreen;
-    if (fixed_view_honored && opts.launcher_num_aspects > 0 &&
+    if (opts.launcher_aspects_host_only && opts.launcher_num_aspects > 0) {
+        const int index = c.host_aspect_index >= 0 && c.host_aspect_index < opts.launcher_num_aspects
+            ? c.host_aspect_index : opts.launcher_default_aspect;
+        args.push_back("--host-aspect");
+        args.push_back(std::to_string(index));
+    } else if (fixed_view_honored && opts.launcher_num_aspects > 0 &&
         opts.launcher_aspect_view_widths) {
         // Aspect vocabulary (multi-width games): committed index -> width.
         int idx = c.aspect_index;
@@ -720,6 +820,7 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     SeamSolar solar;
     if (opts.has_solar_sensor) seam_solar_load(config_path, &solar);
     if (cfg.skip_launcher && !force_launcher &&
+        !opts.launcher_allow_unpatched &&
         !(opts.launcher_enable_rom_patches && cfg.rom_patch_enabled)) {
         // Boot straight in, but still honor the persisted settings.
         seam_append_setting_args(args, cfg, opts);
@@ -819,6 +920,9 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     if (opts.has_solar_sensor) solar_in_launcher = push_solar_settings(ls, solar);
     ls.screen_kind   = cfg.screen_kind;
     ls.aspect_index  = cfg.aspect_index;
+    if (opts.launcher_aspects_host_only)
+        ls.aspect_index = cfg.host_aspect_index >= 0 && cfg.host_aspect_index < opts.launcher_num_aspects
+            ? cfg.host_aspect_index : opts.launcher_default_aspect;
     ls.assist_tools = cfg.assist_tools;
     ls.assist_fast_forward_multiplier =
         cfg.assist_fast_forward_multiplier;
@@ -832,15 +936,19 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     gbarecomp_seam::set_gyro_sensitivity(ls, cfg.gyro_sensitivity);
     gbarecomp_seam::set_presentation_filters(
         ls, cfg.sharp_filter != 0, cfg.affine_filter != 0);
+    gbarecomp_seam::set_extra_presentation_filters(
+        ls, cfg.smooth_filter, cfg.screen_effect, cfg.screen_effect_strength);
     std::snprintf(ls.bios_path, sizeof(ls.bios_path), "%s", seed_bios.c_str());
     defaults = ls;
     defaults.window_scale = 3; defaults.fullscreen = 0; defaults.volume = 100;
     defaults.linear_filter = 0; defaults.screen_kind = 0;
     defaults.widescreen = 0; defaults.adaptive_view = 0; defaults.aspect_index = 0;
+    if (opts.launcher_aspects_host_only) defaults.aspect_index = opts.launcher_default_aspect;
     defaults.skip_launcher = 0;
     set_gyro_sensitivity(defaults, 1.0f);
     set_presentation_filters(defaults, opts.launcher_default_sharp_filter,
                              opts.launcher_default_affine_filter);
+    set_extra_presentation_filters(defaults, 0, 0, 35);
     for (int i = 0; i < 10; ++i) {
         defaults.player_key_bind[0][i] = binding_defaults.player_key[spec_to_bit[i]];
         defaults.player_pad_bind[0][i] = binding_defaults.player_pad[spec_to_bit[i]];
@@ -953,10 +1061,16 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     gi.rom_patch_note = opts.launcher_rom_patch_note;
     gi.rom_patch_cache_dir = rom_patch_cache_dir.c_str();
     gi.rom_patch_required_sha1 = opts.launcher_required_patch_sha1;
+    gi.rom_patch_allow_unpatched = opts.launcher_allow_unpatched;
+    gi.unpatched_label = opts.launcher_unpatched_label;
+    gi.patched_label = opts.launcher_patched_label;
     gbarecomp_seam::set_has_gyro_controls(gi, opts.launcher_expose_gyro);
     gbarecomp_seam::set_presentation_filter_caps(
         gi, opts.launcher_expose_sharp_filter,
         opts.launcher_expose_affine_filter);
+    gbarecomp_seam::set_extra_presentation_filter_caps(
+        gi, opts.launcher_expose_smooth_filter,
+        opts.launcher_expose_screen_effects);
 #if defined(GBARECOMP_ENABLE_MODS)
     gi.mods = mod_provider;
 #endif
@@ -968,6 +1082,10 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
         gi.num_aspect_labels   = opts.launcher_num_aspects;
         gi.aspect_experimental = 1;
         gi.widescreen_supported = 0;   // the cycle supersedes the bool toggle
+        if (opts.launcher_aspects_host_only) {
+            gi.aspect_setting_label = "Game aspect ratio";
+            gi.aspect_setting_help = "Changes the rendered view, not a stretch. Original GBA, 16:9 or 12:5. Also available during play in Esc > Graphics; unsupported scenes retain their native view.";
+        }
     }
     // Save row: the explicit per-game save path when the game declares one,
     // else the runtime's <rom>.sav convention derived from the seeded ROM.
@@ -979,9 +1097,16 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
         p.replace_extension(".sav");
         save_display = p.string();
     }
+    std::string patched_save_display;
+    if (opts.launcher_patched_save_path && *opts.launcher_patched_save_path)
+        patched_save_display = state_path(opts.launcher_patched_save_path, "");
     for (size_t i = 1; i + 1 < args.size(); ++i)
-        if (args[i] == "--save") save_display = std::filesystem::absolute(args[i+1]).string();
+        if (args[i] == "--save") {
+            save_display = std::filesystem::absolute(args[i+1]).string();
+            patched_save_display = save_display; // explicit diagnostic override
+        }
     if (!save_display.empty()) gi.sram_path = save_display.c_str();
+    if (!patched_save_display.empty()) gi.patched_sram_path = patched_save_display.c_str();
 
     std::string title = std::string(gi.name) + " \xE2\x80\x94 Launcher";
 
@@ -989,6 +1114,8 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     int rc = recomp_launcher_run_window(title.c_str(), &ls, &gi, dir.c_str(),
                                         seed_rom.c_str(),
                                         picked_rom, sizeof(picked_rom));
+    if (opts.launcher_allow_unpatched && ls.selected_sram_path[0])
+        save_display = ls.selected_sram_path;
     if (rc == 1 && !opts.launcher_hybrid_input) return 1;
     if (rc != 0 && rc != 1) return 1; // fail closed; do not bypass the launcher
 
@@ -1004,6 +1131,8 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
         gbarecomp_seam::get_sharp_filter(ls, cfg.sharp_filter != 0) ? 1 : 0;
     cfg.affine_filter =
         gbarecomp_seam::get_affine_filter(ls, cfg.affine_filter != 0) ? 1 : 0;
+    gbarecomp_seam::get_extra_presentation_filters(
+        ls, cfg.smooth_filter, cfg.screen_effect, cfg.screen_effect_strength);
     cfg.screen_kind   = (ls.screen_kind >= 0 && ls.screen_kind <= 4)
                           ? ls.screen_kind : 0;
     cfg.volume        = ls.volume;
@@ -1014,6 +1143,7 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
                          ls.aspect_index >= 0 &&
                          ls.aspect_index < opts.launcher_num_aspects)
                           ? ls.aspect_index : 0;
+    if (opts.launcher_aspects_host_only) cfg.host_aspect_index = cfg.aspect_index;
     cfg.gyro_sensitivity =
         std::clamp(gbarecomp_seam::get_gyro_sensitivity(
                        ls, cfg.gyro_sensitivity),

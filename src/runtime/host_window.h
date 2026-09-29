@@ -86,6 +86,19 @@ public:
     int  window_scale() const;
     void set_linear_filter(bool enabled);
     bool linear_filter() const;
+    // Final display only: 0 nearest, 1 linear, 2 sharp, 3 Smooth 2x.
+    // Effects: 0 off, 1 LCD grid, 2 CRT. Neither modifies guest scanout.
+    void set_scaling_filter(int mode);
+    int scaling_filter() const;
+    void set_screen_effect(int mode, int strength);
+    int screen_effect() const;
+    int screen_effect_strength() const;
+    struct FilterStats {
+        std::uint64_t frames = 0, sharp_frames = 0, smooth_frames = 0;
+        std::uint64_t effect_frames = 0, fallback_frames = 0;
+        double preparation_ms = 0;
+    };
+    FilterStats filter_stats() const;
     void set_audio_enabled(bool enabled);
     void set_game_paused(bool paused);
     bool audio_enabled() const;

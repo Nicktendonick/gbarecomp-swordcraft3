@@ -7,7 +7,7 @@
 #include <vector>
 
 namespace gbarecomp {
-// Fixed-width first milestone. An independent host surface must never opt the
+// An independent, optionally resizable host surface must never opt the
 // guest PPU into expanded scanout, OAM overrides, or different game execution.
 class HostPresentation {
     unsigned requested_;
@@ -16,6 +16,11 @@ class HostPresentation {
 public:
     HostPresentation(unsigned width, HostFrameRenderer draw)
         : requested_(width), draw_(draw) {}
+    bool set_width(unsigned width) {
+        if (!draw_ || width < 240 || width > 480) return false;
+        requested_ = width;
+        return true;
+    }
     bool active(const gba::GbaPpu& ppu) const {
         return draw_ && !ppu.view_expanded() && requested_ > 240 && requested_ <= 480;
     }

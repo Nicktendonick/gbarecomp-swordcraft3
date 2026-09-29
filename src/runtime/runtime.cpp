@@ -21,6 +21,7 @@
 
 #include "runtime.h"
 #include "runtime_menu_preferences.h"
+#include "presentation_preferences.h"
 #include "view_config.h"
 #include "host_presentation.h"
 
@@ -176,6 +177,9 @@ struct Args {
     int  volume = 100;            // --volume 0..100: pushed-sample gain
     bool linear_filter = false;   // --linear-filter 1: linear texture scaling
     bool sharp_filter = false;    // --sharp-filter 1: integer prescale + linear finish
+    bool smooth_filter = false;
+    int screen_effect = 0;        // --screen-effect off|lcd|crt
+    int screen_effect_strength = 35;
     bool affine_filter = false;   // --affine-filter 1: game-authorized smoothing
     float gyro_sensitivity = 0.25f; // --gyro-sensitivity 0.25..4.00
     // [audio] shadow = true|false — arm the MP2K verified-enhancement shadow
@@ -197,6 +201,7 @@ struct Args {
     // legacy `widescreen=N` inputs are converted immediately to 240 + 2*N so
     // there is never a second source of truth downstream.
     int view_width = 240;
+    int host_aspect = -1;
     // Opt-in policy where the window drawable aspect selects view_width live.
     // Authorization remains game-owned through RunOptions::resize_driven_view.
     bool resize_view = false;
@@ -213,6 +218,10 @@ struct Args {
 #define GBARECOMP_UI_KEY_FAST_FORWARD   "assist.fast_forward"
 #define GBARECOMP_UI_KEY_FAST_FORWARD_SPEED "assist.fast_forward_speed"
 #define GBARECOMP_UI_KEY_REWIND          "assist.rewind"
+#define GBARECOMP_UI_KEY_SCALING         "graphics.scaling_filter"
+#define GBARECOMP_UI_KEY_SCREEN_EFFECT   "graphics.screen_effect"
+#define GBARECOMP_UI_KEY_EFFECT_STRENGTH "graphics.screen_effect_strength"
+#define GBARECOMP_UI_KEY_HOST_ASPECT     "graphics.host_aspect"
 
 struct RuntimeUiContext {
     HostWindow* window = nullptr;
@@ -220,6 +229,8 @@ struct RuntimeUiContext {
     float* gyro_sensitivity = nullptr;
     int view_mode = RECOMP_RUNTIME_UI_VIEW_NATIVE;
     bool view_mode_dirty = false;
+    int host_aspect_index = -1;
+    bool host_aspect_dirty = false;
     // Menu-driven state slots, drained by the main loop alongside the
     // equivalent hotkeys so both paths share one implementation.
     int state_slot = 1;
@@ -230,6 +241,7 @@ struct RuntimeUiContext {
     int pending_pause = -1;
     bool* manual_pause = nullptr;
     RuntimeMenuPreferences menu_preferences;
+    std::filesystem::path presentation_preferences_path;
     bool pending_close = false;
     bool pending_reset = false;
     bool assist_tools_exposed = false;
@@ -257,6 +269,10 @@ int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_WINDOW_SCALE) == 0) *out = c->window->window_scale();
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_VIEW_MODE) == 0) *out = c->view_mode;
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER) == 0) *out = c->window->linear_filter();
+    else if (std::strcmp(item->key, GBARECOMP_UI_KEY_SCALING) == 0) *out = c->window->scaling_filter();
+    else if (std::strcmp(item->key, GBARECOMP_UI_KEY_SCREEN_EFFECT) == 0) *out = c->window->screen_effect();
+    else if (std::strcmp(item->key, GBARECOMP_UI_KEY_EFFECT_STRENGTH) == 0) *out = c->window->screen_effect_strength();
+    else if (std::strcmp(item->key, GBARECOMP_UI_KEY_HOST_ASPECT) == 0) *out = c->host_aspect_index;
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_AUDIO) == 0) *out = c->window->audio_enabled();
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_VOLUME) == 0) *out = c->window->volume();
     else if (std::strcmp(item->key, GBARECOMP_UI_KEY_STATE_SLOT) == 0) *out = c->state_slot;
@@ -281,6 +297,28 @@ int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
 int runtime_ui_set(void* opaque, const RecompRuntimeUiItem* item, int value) {
     auto* c = static_cast<RuntimeUiContext*>(opaque);
     if (!c || !c->window || !item) return 0;
+    if (std::strcmp(item->key, GBARECOMP_UI_KEY_HOST_ASPECT) == 0) {
+        if (!c->opts || !c->opts->launcher_aspects_host_only || !c->opts->host_frame_set_width ||
+            !save_host_aspect_preference(c->presentation_preferences_path, value, c->opts->launcher_num_aspects)) return 0;
+        c->host_aspect_index = value;
+        c->host_aspect_dirty = true;
+        return 1;
+    }
+    const bool scaling_item = std::strcmp(item->key, GBARECOMP_UI_KEY_SCALING) == 0;
+    const bool effect_item = std::strcmp(item->key, GBARECOMP_UI_KEY_SCREEN_EFFECT) == 0;
+    const bool strength_item = std::strcmp(item->key, GBARECOMP_UI_KEY_EFFECT_STRENGTH) == 0;
+    if (scaling_item || effect_item || strength_item) {
+        const int scaling = scaling_item ? value : c->window->scaling_filter();
+        const int effect = effect_item ? value : c->window->screen_effect();
+        const int strength = strength_item ? value : c->window->screen_effect_strength();
+        if (!save_presentation_preferences(c->presentation_preferences_path, scaling, effect, strength)) {
+            std::fprintf(stderr, "[presentation] Could not save display preferences; previous values retained.\n");
+            return 0;
+        }
+        if (scaling_item) c->window->set_scaling_filter(scaling);
+        else c->window->set_screen_effect(effect, strength);
+        return 1;
+    }
     if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_PAUSE_ON_OPEN) == 0) {
         if (value != 0 && value != 1) return 0;
         const bool ok = c->menu_preferences.set_pause_on_open(value != 0);
@@ -389,6 +427,8 @@ int runtime_ui_set_text(void* opaque, const RecompRuntimeUiItem* item,
 int runtime_ui_enabled(void* opaque, const RecompRuntimeUiItem* item) {
     auto* c = static_cast<RuntimeUiContext*>(opaque);
     if (!c || !item) return 1;
+    if (std::strcmp(item->key, GBARECOMP_UI_KEY_EFFECT_STRENGTH) == 0)
+        return c->window && c->window->screen_effect() != 0;
     if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_WINDOW_SCALE) == 0)
         return c->window->fullscreen() == 0;
     if (c->assist_tools_exposed &&
@@ -769,6 +809,20 @@ bool apply_toml_file(const std::filesystem::path& path, Args* args,
             args->resize_view = (val == "true" || val == "1");
         } else if (section == "video" && key == "sharp_filter") {
             args->sharp_filter = (val == "true" || val == "1");
+        } else if (section == "video" && key == "smooth_filter") {
+            args->smooth_filter = (val == "true" || val == "1");
+        } else if (section == "video" && key == "screen_effect") {
+            if (val != "off" && val != "lcd" && val != "crt") {
+                if (err) *err = "invalid [video].screen_effect (expected off, lcd or crt)";
+                return false;
+            }
+            args->screen_effect = val == "lcd" ? 1 : val == "crt" ? 2 : 0;
+        } else if (section == "video" && key == "screen_effect_strength") {
+            if (!parse_int(val.c_str(), &args->screen_effect_strength) ||
+                args->screen_effect_strength < 0 || args->screen_effect_strength > 100) {
+                if (err) *err = "invalid [video].screen_effect_strength (expected 0..100)";
+                return false;
+            }
         } else if (section == "video" && key == "affine_filter") {
             args->affine_filter = (val == "true" || val == "1");
         } else if (section == "video" && key == "widescreen") {
@@ -804,7 +858,9 @@ void find_config_arg(int argc, char** argv, Args* args) {
              s == "--view-width" || s == "--widescreen" ||
              s == "--save" || s == "--save-path" ||
              s == "--gyro-sensitivity" || s == "--sharp-filter" ||
-             s == "--affine-filter") &&
+             s == "--affine-filter" || s == "--linear-filter" || s == "--screen" ||
+             s == "--volume" || s == "--smooth-filter" || s == "--screen-effect" ||
+             s == "--screen-effect-strength" || s == "--host-aspect") &&
             i + 1 < argc) {
             ++i;
             continue;
@@ -966,6 +1022,14 @@ bool parse_cli(int argc, char** argv, Args* args, std::string* err) {
             }
             continue;
         }
+        if (s == "--host-aspect") {
+            const char* v = need_value("--host-aspect");
+            if (!v || !parse_int(v, &args->host_aspect) || args->host_aspect < 0) {
+                if (err) *err = "invalid --host-aspect index";
+                return false;
+            }
+            continue;
+        }
         if (s == "--resize-view") {
             args->resize_view = true;
             continue;
@@ -1037,6 +1101,34 @@ bool parse_cli(int argc, char** argv, Args* args, std::string* err) {
                 return false;
             }
             args->sharp_filter = sf != 0;
+            continue;
+        }
+        if (s == "--smooth-filter") {
+            const char* v = need_value("--smooth-filter");
+            int enabled = 0;
+            if (!v || !parse_int(v, &enabled) || (enabled != 0 && enabled != 1)) {
+                if (err) *err = "invalid --smooth-filter value (expected 0 or 1)";
+                return false;
+            }
+            args->smooth_filter = enabled != 0;
+            continue;
+        }
+        if (s == "--screen-effect") {
+            const char* v = need_value("--screen-effect");
+            if (!v || (std::strcmp(v, "off") && std::strcmp(v, "lcd") && std::strcmp(v, "crt"))) {
+                if (err) *err = "invalid --screen-effect value (expected off, lcd or crt)";
+                return false;
+            }
+            args->screen_effect = !std::strcmp(v, "lcd") ? 1 : !std::strcmp(v, "crt") ? 2 : 0;
+            continue;
+        }
+        if (s == "--screen-effect-strength") {
+            const char* v = need_value("--screen-effect-strength");
+            if (!v || !parse_int(v, &args->screen_effect_strength) ||
+                args->screen_effect_strength < 0 || args->screen_effect_strength > 100) {
+                if (err) *err = "invalid --screen-effect-strength value (expected 0..100)";
+                return false;
+            }
             continue;
         }
         if (s == "--affine-filter") {
@@ -2351,7 +2443,31 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
 
     HostWindow win;
     std::vector<uint8_t> live_fb;
-    HostPresentation host_surface(opts.host_presentation_width, opts.host_frame_renderer);
+    const bool host_aspects = opts.launcher_aspects_host_only && opts.launcher_num_aspects > 0 &&
+        opts.launcher_aspect_labels && opts.launcher_aspect_view_widths &&
+        opts.host_frame_renderer && opts.host_frame_set_width && !ppu.view_expanded();
+    unsigned initial_host_width = opts.host_presentation_width;
+    const auto presentation_path = [&]() -> std::filesystem::path {
+        if (!opts.launcher_config_filename || !*opts.launcher_config_filename) return {};
+        const auto base = opts.data_root && *opts.data_root ? std::filesystem::path(opts.data_root)
+            : std::filesystem::absolute(argv[0]).parent_path();
+        return base / opts.launcher_config_filename;
+    }();
+    if (host_aspects) {
+        if (args.host_aspect < 0)
+            args.host_aspect = read_host_aspect_preference(presentation_path, opts.launcher_num_aspects)
+                .value_or(opts.launcher_default_aspect);
+        if (args.host_aspect < 0 || args.host_aspect >= opts.launcher_num_aspects ||
+            opts.launcher_aspect_view_widths[args.host_aspect] < 240 ||
+            opts.launcher_aspect_view_widths[args.host_aspect] > 480) {
+            std::fprintf(stderr, "Invalid host aspect preset.\n"); runtime_shutdown(); return 1;
+        }
+        initial_host_width = opts.launcher_aspect_view_widths[args.host_aspect];
+        opts.host_frame_set_width(static_cast<std::uint16_t>(initial_host_width));
+    } else if (args.host_aspect >= 0) {
+        std::fprintf(stderr, "This game does not support host-only aspect presets.\n"); runtime_shutdown(); return 1;
+    }
+    HostPresentation host_surface(initial_host_width, opts.host_frame_renderer);
     if (opts.host_frame_reset) opts.host_frame_reset();
     // Optional delivered-PCM evidence stream. This captures the signed
     // interleaved S16 samples after guest/mod mixing but before SDL buffering,
@@ -2605,6 +2721,33 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     };
     auto sync_resize_driven_view = [&]() -> bool {
 #if defined(GBARECOMP_RUNTIME_UI)
+        if (host_aspects && runtime_ui_context.host_aspect_dirty && win.is_open()) {
+            runtime_ui_context.host_aspect_dirty = false;
+            const int index = runtime_ui_context.host_aspect_index;
+            const auto width = opts.launcher_aspect_view_widths[index];
+            bool resized = false;
+            if (index == args.host_aspect) return false;
+            try {
+                std::vector<std::uint8_t> replacement(std::size_t(width) * 160 * 3, 0);
+                if (width >= 240 && width <= 480 && win.set_surface_size(width, 160)) {
+                    live_fb.swap(replacement);
+                    host_surface.set_width(width);
+                    opts.host_frame_set_width(width);
+                    args.host_aspect = index;
+                    resized = true;
+                    std::fprintf(stderr, "[host-aspect] index=%d host=%u guest=%u frame=%llu\n",
+                        index, unsigned(width), ppu.render_width(), (unsigned long long)ppu.frame_count());
+                }
+            } catch (const std::bad_alloc&) {}
+            if (!resized) {
+                runtime_ui_context.host_aspect_index = args.host_aspect;
+                save_host_aspect_preference(presentation_path, args.host_aspect, opts.launcher_num_aspects);
+                std::fprintf(stderr, "[host-aspect] Resize unavailable; keeping previous view.\n");
+            }
+            // Guest scanout did not change. Keep the completed native frame;
+            // reset renderer caches supply fresh wide content next frame.
+            return false;
+        }
         if (runtime_ui_context.view_mode_dirty && win.is_open()) {
             runtime_ui_context.view_mode_dirty = false;
             resize_view_enabled = runtime_ui_context.view_mode ==
@@ -2682,6 +2825,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                                   opts.launcher_keybinds_filename);
         }
         if (args.fullscreen) win.set_fullscreen(args.fullscreen);
+        win.set_scaling_filter(args.smooth_filter ? 3 : args.sharp_filter ? 2 : args.linear_filter ? 1 : 0);
+        win.set_screen_effect(args.screen_effect, args.screen_effect_strength);
         win.set_volume(args.volume);
         win.set_fps_readout(opts.show_fps_by_default);
         if (visible_debugger) {
@@ -2691,6 +2836,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         }
 #if defined(GBARECOMP_RUNTIME_UI)
         runtime_ui_context.window = &win;
+        if ((opts.launcher_expose_sharp_filter || opts.launcher_expose_smooth_filter ||
+             opts.launcher_expose_screen_effects || host_aspects) && opts.launcher_config_filename && *opts.launcher_config_filename) {
+            const auto base = opts.data_root && *opts.data_root ? std::filesystem::path(opts.data_root)
+                : std::filesystem::absolute(argv[0]).parent_path();
+            runtime_ui_context.presentation_preferences_path = base / opts.launcher_config_filename;
+        }
         runtime_ui_context.gyro_sensitivity = &args.gyro_sensitivity;
         runtime_ui_context.assist_tools_exposed = opts.expose_assist_tools;
         runtime_ui_context.assist_tools_enabled =
@@ -2735,10 +2886,46 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         runtime_ui_config.menu.callbacks.set_text = runtime_ui_set_text;
 #endif
         runtime_ui_config.features =
-            RECOMP_RUNTIME_UI_STANDARD_LINEAR_FILTER |
             RECOMP_RUNTIME_UI_STANDARD_AUDIO |
             RECOMP_RUNTIME_UI_STANDARD_VOLUME |
             RECOMP_RUNTIME_UI_STANDARD_RESUME;
+        if (host_aspects) {
+            runtime_ui_context.host_aspect_index = args.host_aspect;
+            RecompRuntimeUiItem item{};
+            item.key = GBARECOMP_UI_KEY_HOST_ASPECT; item.section = "Graphics"; item.label = "Game aspect ratio";
+            item.description = "Changes the rendered view, not a stretch. Saved beside the launcher. While paused, the new view is applied on Resume. Unsupported scenes retain their native framing.";
+            item.type = RECOMP_RUNTIME_UI_CHOICE; item.minimum = 0;
+            item.maximum = opts.launcher_num_aspects - 1; item.step = 1;
+            item.choices = opts.launcher_aspect_labels; item.choice_count = opts.launcher_num_aspects;
+            runtime_ui_extras.push_back(item);
+            std::fprintf(stderr, "[host-aspect] initial index=%d host=%u guest=%u\n", args.host_aspect, host_surface.width(ppu), ppu.render_width());
+        }
+        if (!opts.launcher_expose_sharp_filter && !opts.launcher_expose_smooth_filter)
+            runtime_ui_config.features |= RECOMP_RUNTIME_UI_STANDARD_LINEAR_FILTER;
+        else {
+            static const char* const scaling_choices[] = {"Original (nearest)", "Linear", "Sharp", "Smooth 2x"};
+            RecompRuntimeUiItem item{};
+            item.key = GBARECOMP_UI_KEY_SCALING; item.section = "Graphics"; item.label = "Scaling filter";
+            item.description = "Filters only the game image. Original preserves pixel edges; Sharp suits fractional sizes. Smooth 2x softly rounds edges, but is CPU-heavy and may lower FPS in widescreen combat.";
+            item.type = RECOMP_RUNTIME_UI_CHOICE; item.minimum = 0;
+            item.maximum = opts.launcher_expose_smooth_filter ? 3 : 2; item.step = 1;
+            item.choices = scaling_choices; item.choice_count = item.maximum + 1;
+            runtime_ui_extras.push_back(item);
+        }
+        if (opts.launcher_expose_screen_effects) {
+            static const char* const effects[] = {"Off", "LCD Grid", "CRT"};
+            RecompRuntimeUiItem item{};
+            item.key = GBARECOMP_UI_KEY_SCREEN_EFFECT; item.section = "Graphics"; item.label = "Screen effect";
+            item.description = "LCD adds a pixel grid; CRT adds scanlines and a subtle edge vignette. Does not filter the Esc menu.";
+            item.type = RECOMP_RUNTIME_UI_CHOICE; item.minimum = 0; item.maximum = 2; item.step = 1;
+            item.choices = effects; item.choice_count = 3;
+            runtime_ui_extras.push_back(item);
+            item = {};
+            item.key = GBARECOMP_UI_KEY_EFFECT_STRENGTH; item.section = "Graphics"; item.label = "Effect intensity";
+            item.description = "0 disables the visible effect; 100 is full strength. Changes are saved beside the launcher.";
+            item.type = RECOMP_RUNTIME_UI_INT; item.minimum = 0; item.maximum = 100; item.step = 5;
+            runtime_ui_extras.push_back(item);
+        }
         if (opts.ui_session_controls)
             runtime_ui_config.features |= RECOMP_RUNTIME_UI_STANDARD_PAUSE | RECOMP_RUNTIME_UI_STANDARD_CLOSE |
                 RECOMP_RUNTIME_UI_STANDARD_PAUSE_ON_OPEN;
@@ -3110,6 +3297,11 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     action == "menu_pause" || action == "menu_resume" || action == "menu_reset" ||
                     action == "menu_close" || action == "menu_cancel" || action == "menu_confirm" || action == "menu_probe";
                 action_valid = action_valid || action == "menu_auto_on" || action == "menu_auto_off";
+                if (action.rfind("menu_scaling=", 0) == 0 || action.rfind("menu_effect=", 0) == 0 ||
+                    action.rfind("menu_strength=", 0) == 0 || action.rfind("menu_aspect=", 0) == 0) {
+                    int value = 0;
+                    action_valid = parse_int(action.c_str() + action.find('=') + 1, &value);
+                }
             } else if (action.rfind("save", 0) == 0 ||
                        action.rfind("load", 0) == 0) {
                 const bool save = action.rfind("save", 0) == 0;
@@ -3189,6 +3381,14 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                             RecompRuntimeUiItem preference{};
                             preference.key = RECOMP_RUNTIME_UI_KEY_PAUSE_ON_OPEN;
                             runtime_ui_set(&runtime_ui_context, &preference, key == "auto_on");
+                        } else if (key.rfind("scaling=", 0) == 0 || key.rfind("effect=", 0) == 0 || key.rfind("strength=", 0) == 0 || key.rfind("aspect=", 0) == 0) {
+                            RecompRuntimeUiItem preference{};
+                            preference.key = key.rfind("scaling=", 0) == 0 ? GBARECOMP_UI_KEY_SCALING :
+                                key.rfind("effect=", 0) == 0 ? GBARECOMP_UI_KEY_SCREEN_EFFECT :
+                                key.rfind("aspect=", 0) == 0 ? GBARECOMP_UI_KEY_HOST_ASPECT : GBARECOMP_UI_KEY_EFFECT_STRENGTH;
+                            int value = 0;
+                            if (parse_int(key.c_str() + key.find('=') + 1, &value))
+                                runtime_ui_set(&runtime_ui_context, &preference, value);
                         } else if (key != "probe")
                             recomp_runtime_ui_activate(ui, ("system." + key).c_str());
                         std::fprintf(stderr, "[runtime-menu] event=%s pump=%llu frame=%llu cycles=%llu pc=%08x manual_pause=%d open=%d confirm=%d audio=%d auto_pause=%d\n",
@@ -3196,6 +3396,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                             (unsigned long long)ppu.frame_count(), (unsigned long long)cycles_elapsed,
                             g_cpu.R[15], host_paused, recomp_runtime_ui_is_open(ui),
                             recomp_runtime_ui_confirmation_pending(ui), win.audio_enabled(), runtime_ui_context.menu_preferences.pause_on_open());
+                        std::fprintf(stderr, "[runtime-filters] scaling=%d effect=%d strength=%d\n",
+                            win.scaling_filter(), win.screen_effect(), win.screen_effect_strength());
+                        if (host_aspects) std::fprintf(stderr, "[runtime-aspect] selected=%d applied=%d host=%u guest=%u\n",
+                            runtime_ui_context.host_aspect_index, args.host_aspect, host_surface.width(ppu), ppu.render_width());
                     }
 #endif
                     break;

@@ -17,6 +17,7 @@
 
 #include "color_lut.h"
 #include "presentation_layout.h"
+#include "presentation_filters.h"
 #if defined(GBARECOMP_RUNTIME_UI)
 #include "recomp_runtime_ui.h"
 #endif
@@ -377,6 +378,15 @@ struct Backend {
     bool freely_resizable_window = false;
     bool linear_filter = false;
     bool sharp_filter = false;
+    bool smooth_filter = false;
+    int screen_effect = 0;
+    int effect_strength = 35;
+    SDL_Texture* smooth_texture = nullptr;
+    SDL_Texture* effect_texture = nullptr;
+    bool smooth_failed = false, effect_failed = false;
+    bool textures_lost = false;
+    runtime::SmoothScaler smooth;
+    HostWindow::FilterStats filters;
 
     // ---- rebindable input (see HostWindow::load_input_config) --------------
     // GBA KEYINPUT bit (0..9) per bound SDL scancode; seeded from the
@@ -414,6 +424,81 @@ void destroy_sharp_texture(Backend* b) {
     b->sharp_texture = nullptr;
     b->sharp_texture_w = 0;
     b->sharp_texture_h = 0;
+}
+
+void destroy_effect_textures(Backend* b) {
+    if (b->smooth_texture) SDL_DestroyTexture(b->smooth_texture);
+    if (b->effect_texture) SDL_DestroyTexture(b->effect_texture);
+    b->smooth_texture = b->effect_texture = nullptr;
+    b->smooth_failed = b->effect_failed = false;
+}
+
+bool explicit_presentation(const Backend* b) {
+    return b->expanded_view || b->resize_driven_view || b->freely_resizable_window ||
+           b->sharp_filter || b->smooth_filter || b->screen_effect != 0;
+}
+
+void update_logical_size(Backend* b) {
+#if !defined(__ANDROID__)
+    int w = 0, h = 0;
+    SDL_RenderGetLogicalSize(b->renderer, &w, &h);
+    const int desired_w = explicit_presentation(b) ? 0 : b->base_w;
+    const int desired_h = explicit_presentation(b) ? 0 : b->base_h;
+    if (w != desired_w || h != desired_h)
+        SDL_RenderSetLogicalSize(b->renderer, desired_w, desired_h);
+#endif
+}
+
+SDL_Texture* prepare_smooth(Backend* b, const uint8_t* rgb) {
+    if (!b->smooth_filter || b->smooth_failed) return nullptr;
+    if (!b->smooth_texture) {
+        b->smooth_texture = SDL_CreateTexture(b->renderer, SDL_PIXELFORMAT_ARGB8888,
+            SDL_TEXTUREACCESS_STREAMING, b->base_w * 2, b->base_h * 2);
+        if (b->smooth_texture) {
+            SDL_SetTextureBlendMode(b->smooth_texture, SDL_BLENDMODE_NONE);
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+            SDL_SetTextureScaleMode(b->smooth_texture, SDL_ScaleModeLinear);
+#endif
+        }
+    }
+    if (b->smooth_texture && b->smooth.scale2x(rgb, b->base_w, b->base_h) &&
+        SDL_UpdateTexture(b->smooth_texture, nullptr, b->smooth.output().data(), b->base_w * 8) == 0)
+        return b->smooth_texture;
+    b->smooth_failed = true; // Retry only after a settings/size change.
+    std::fprintf(stderr, "[presentation] Smooth 2x unavailable; using original scaling: %s\n", SDL_GetError());
+    return nullptr;
+}
+
+bool draw_screen_effect(Backend* b, const SDL_Rect& destination) {
+    if (!b->screen_effect || !b->effect_strength) return true;
+    if (b->effect_failed) return false;
+    if (!b->effect_texture) {
+        runtime::EffectMask mask;
+        if (runtime::build_screen_effect_mask(b->base_w, b->base_h,
+                b->screen_effect, b->effect_strength, mask)) {
+            b->effect_texture = SDL_CreateTexture(b->renderer, SDL_PIXELFORMAT_RGBA32,
+                SDL_TEXTUREACCESS_STATIC, mask.width, mask.height);
+            if (b->effect_texture) {
+                if (SDL_UpdateTexture(b->effect_texture, nullptr, mask.rgba.data(), mask.width * 4) != 0) {
+                    SDL_DestroyTexture(b->effect_texture); b->effect_texture = nullptr;
+                } else {
+                    if (SDL_SetTextureBlendMode(b->effect_texture, SDL_BLENDMODE_BLEND) != 0) {
+                        SDL_DestroyTexture(b->effect_texture); b->effect_texture = nullptr;
+                    }
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+                    if (b->effect_texture) SDL_SetTextureScaleMode(b->effect_texture, SDL_ScaleModeLinear);
+#endif
+                }
+            }
+        }
+    }
+    if (b->effect_texture && SDL_RenderCopy(b->renderer, b->effect_texture, nullptr, &destination) == 0) {
+        ++b->filters.effect_frames;
+        return true;
+    }
+    b->effect_failed = true;
+    std::fprintf(stderr, "[presentation] screen effect unavailable; showing unfiltered image: %s\n", SDL_GetError());
+    return false;
 }
 
 bool ensure_sharp_texture(Backend* b, int factor) {
@@ -1203,7 +1288,7 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
     SDL_RenderSetLogicalSize(b->renderer, 0, 0);
     SDL_SetRenderDrawColor(b->renderer, 7, 11, 20, 255);
 #else
-    if (b->expanded_view || b->resize_driven_view) {
+    if (explicit_presentation(b)) {
         // The destination viewport is computed explicitly in present() so
         // resizing maximally fills the drawable at the selected widescreen
         // aspect. Exact multiples retain integer scale; filtering follows the
@@ -1491,6 +1576,13 @@ void HostWindow::close() {
     runtime_imgui_shutdown(b);
 #endif
     destroy_sharp_texture(b);
+    destroy_effect_textures(b);
+    if (b->filters.frames) {
+        std::fprintf(stderr, "[presentation-summary] frames=%llu sharp=%llu smooth=%llu effect=%llu fallback=%llu preparation_ms=%.3f\n",
+            (unsigned long long)b->filters.frames, (unsigned long long)b->filters.sharp_frames,
+            (unsigned long long)b->filters.smooth_frames, (unsigned long long)b->filters.effect_frames,
+            (unsigned long long)b->filters.fallback_frames, b->filters.preparation_ms);
+    }
     if (b->texture)   SDL_DestroyTexture(b->texture);
     if (b->renderer)  SDL_DestroyRenderer(b->renderer);
     if (b->window)    SDL_DestroyWindow(b->window);
@@ -1502,7 +1594,7 @@ void HostWindow::close() {
 bool HostWindow::set_surface_size(int base_w, int base_h) {
     if (!open_ || !impl_ || base_w < 1 || base_h < 1) return false;
     auto* b = static_cast<Backend*>(impl_);
-    if (base_w == b->base_w && base_h == b->base_h) return true;
+    if (base_w == b->base_w && base_h == b->base_h && !b->textures_lost) return true;
 
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY,
                 b->linear_filter ? "linear" : "nearest");
@@ -1522,10 +1614,13 @@ bool HostWindow::set_surface_size(int base_w, int base_h) {
 #endif
     SDL_DestroyTexture(b->texture);
     destroy_sharp_texture(b);
+    destroy_effect_textures(b);
     b->texture = replacement;
+    b->textures_lost = false;
     b->base_w = base_w;
     b->base_h = base_h;
     b->expanded_view = base_w != 240 || base_h != 160;
+    update_logical_size(b);
     if (b->color_lut && !b->color_lut->is_passthrough())
         b->graded_fb.resize(static_cast<std::size_t>(base_w) * base_h * 3u);
     return true;
@@ -1564,6 +1659,10 @@ bool HostWindow::drawable_size(int* width, int* height) const {
 void HostWindow::present(const uint8_t* rgb888) {
     if (!open_ || !impl_ || !rgb888) return;
     auto* b = static_cast<Backend*>(impl_);
+    if (b->textures_lost && !set_surface_size(b->base_w, b->base_h)) return;
+    const Uint64 prepare_start = SDL_GetPerformanceCounter();
+    const auto fallbacks_before = b->filters.fallback_frames;
+    ++b->filters.frames;
     // Present-time color grading (opt-in). Raw is passthrough: the raw
     // PPU frame is uploaded untouched, so verify/frame-hash are unaffected.
     if (b->color_lut && !b->color_lut->is_passthrough() &&
@@ -1572,6 +1671,10 @@ void HostWindow::present(const uint8_t* rgb888) {
         rgb888 = b->graded_fb.data();
     }
     SDL_UpdateTexture(b->texture, nullptr, rgb888, b->base_w * 3);
+    SDL_Texture* smooth_texture = prepare_smooth(b, rgb888);
+    SDL_Texture* game_texture = smooth_texture ? smooth_texture : b->texture;
+    if (smooth_texture) ++b->filters.smooth_frames;
+    else if (b->smooth_filter) ++b->filters.fallback_frames;
     SDL_SetRenderDrawColor(b->renderer, 7, 11, 20, 255);
     SDL_RenderClear(b->renderer);
 #if defined(__ANDROID__)
@@ -1604,9 +1707,14 @@ void HostWindow::present(const uint8_t* rgb888) {
         (drawable_h - game_h) / 2,
         game_w,
         game_h};
-    SDL_RenderCopy(b->renderer, b->texture, nullptr, &destination);
+    if (SDL_RenderCopy(b->renderer, game_texture, nullptr, &destination) != 0 && smooth_texture) {
+        b->smooth_failed = true; // Avoid repeated CPU work until a settings/size/device reset.
+        ++b->filters.fallback_frames; --b->filters.smooth_frames;
+        SDL_RenderCopy(b->renderer, b->texture, nullptr, &destination);
+    }
+    if (!draw_screen_effect(b, destination)) ++b->filters.fallback_frames;
 #else
-    if (!b->expanded_view && !b->resize_driven_view) {
+    if (!explicit_presentation(b)) {
         SDL_RenderCopy(b->renderer, b->texture, nullptr, nullptr);
     } else {
         int drawable_w = 0;
@@ -1645,21 +1753,34 @@ void HostWindow::present(const uint8_t* rgb888) {
                         SDL_RenderCopy(
                             b->renderer, b->sharp_texture, nullptr,
                             &destination) == 0;
+                    if (sharp_presented) ++b->filters.sharp_frames;
                 }
             }
             if (!sharp_presented) {
+                if (sharp_factor > 0) ++b->filters.fallback_frames;
                 // Exact integer scales and unsupported render-target backends
                 // retain the crisp nearest path.
                 SDL_SetRenderTarget(b->renderer, nullptr);
-                SDL_RenderCopy(
-                    b->renderer, b->texture, nullptr, &destination);
+                if (SDL_RenderCopy(b->renderer, game_texture, nullptr, &destination) != 0 && smooth_texture) {
+                    b->smooth_failed = true;
+                    ++b->filters.fallback_frames; --b->filters.smooth_frames;
+                    SDL_RenderCopy(b->renderer, b->texture, nullptr, &destination);
+                }
             }
+            if (!draw_screen_effect(b, destination)) ++b->filters.fallback_frames;
         }
     }
 #endif
+    b->filters.preparation_ms += static_cast<double>(SDL_GetPerformanceCounter() - prepare_start) * 1000.0 / SDL_GetPerformanceFrequency();
+    // Count affected frames, not the number of failed stages in one frame.
+    if (b->filters.fallback_frames > fallbacks_before)
+        b->filters.fallback_frames = fallbacks_before + 1;
     render_touch_controls(b);
 #if defined(GBARECOMP_RUNTIME_UI)
     runtime_imgui_render(b);
+    // A live menu callback may have switched from a legacy logical viewport
+    // to explicit presentation (or back); do not restore stale logical size.
+    update_logical_size(b);
 #endif
     // MC-WS-002: time the present itself (vsync blocks here — or doesn't)
     // and stamp the DWM refresh counter into the cadence ring.
@@ -1835,21 +1956,60 @@ int HostWindow::window_scale() const {
 }
 
 void HostWindow::set_linear_filter(bool enabled) {
+    set_scaling_filter(enabled ? 1 : 0);
+}
+
+void HostWindow::set_scaling_filter(int mode) {
     if (!open_ || !impl_) return;
     auto* b = static_cast<Backend*>(impl_);
-    if (enabled && b->sharp_filter) {
-        b->sharp_filter = false;
-        destroy_sharp_texture(b);
-    }
-    b->linear_filter = enabled;
+    mode = std::clamp(mode, 0, 3);
+    b->linear_filter = mode == 1;
+    b->sharp_filter = mode == 2;
+    b->smooth_filter = mode == 3;
+    destroy_sharp_texture(b);
+    destroy_effect_textures(b);
+    update_logical_size(b);
 #if SDL_VERSION_ATLEAST(2, 0, 12)
     SDL_SetTextureScaleMode(b->texture,
-        enabled ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+        b->linear_filter ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
 #endif
+    std::fprintf(stderr, "[presentation] scaling=%d effect=%d strength=%d source=%dx%d\n",
+        mode, b->screen_effect, b->effect_strength, b->base_w, b->base_h);
 }
 
 bool HostWindow::linear_filter() const {
     return open_ && impl_ && static_cast<const Backend*>(impl_)->linear_filter;
+}
+
+int HostWindow::scaling_filter() const {
+    if (!open_ || !impl_) return 0;
+    const auto* b = static_cast<const Backend*>(impl_);
+    return b->smooth_filter ? 3 : b->sharp_filter ? 2 : b->linear_filter ? 1 : 0;
+}
+
+void HostWindow::set_screen_effect(int mode, int strength) {
+    if (!open_ || !impl_) return;
+    auto* b = static_cast<Backend*>(impl_);
+    b->screen_effect = std::clamp(mode, 0, 2);
+    b->effect_strength = std::clamp(strength, 0, 100);
+    if (b->effect_texture) SDL_DestroyTexture(b->effect_texture);
+    b->effect_texture = nullptr;
+    b->effect_failed = false;
+    update_logical_size(b);
+    std::fprintf(stderr, "[presentation] scaling=%d effect=%d strength=%d source=%dx%d\n",
+        scaling_filter(), b->screen_effect, b->effect_strength, b->base_w, b->base_h);
+}
+
+int HostWindow::screen_effect() const {
+    return open_ && impl_ ? static_cast<const Backend*>(impl_)->screen_effect : 0;
+}
+
+int HostWindow::screen_effect_strength() const {
+    return open_ && impl_ ? static_cast<const Backend*>(impl_)->effect_strength : 35;
+}
+
+HostWindow::FilterStats HostWindow::filter_stats() const {
+    return open_ && impl_ ? static_cast<const Backend*>(impl_)->filters : FilterStats{};
 }
 
 void HostWindow::set_audio_enabled(bool enabled) {
@@ -1880,6 +2040,7 @@ void HostWindow::set_resize_driven_view(bool enabled) {
     if (!open_ || !impl_) return;
     auto* b = static_cast<Backend*>(impl_);
     b->resize_driven_view = enabled;
+    update_logical_size(b);
     SDL_SetWindowResizable(
         b->window,
         enabled || b->expanded_view || b->freely_resizable_window
@@ -1920,6 +2081,20 @@ HostWindow::Events HostWindow::pump() {
 
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
+        if (e.type == SDL_RENDER_TARGETS_RESET || e.type == SDL_RENDER_DEVICE_RESET) {
+            destroy_sharp_texture(b);
+            destroy_effect_textures(b);
+            if (e.type == SDL_RENDER_DEVICE_RESET) {
+                b->textures_lost = true;
+#if defined(GBARECOMP_RUNTIME_UI)
+                if (b->runtime_imgui_ready) {
+                    ImGui::SetCurrentContext(b->runtime_imgui_context);
+                    ImGui_ImplSDLRenderer2_DestroyDeviceObjects();
+                }
+#endif
+            }
+            continue;
+        }
 #if defined(GBARECOMP_RUNTIME_UI)
         const bool finger_event =
             e.type == SDL_FINGERDOWN || e.type == SDL_FINGERMOTION ||
@@ -2228,6 +2403,12 @@ int  HostWindow::volume() const { return 100; }
 int  HostWindow::window_scale() const { return 1; }
 void HostWindow::set_linear_filter(bool /*enabled*/) {}
 bool HostWindow::linear_filter() const { return false; }
+void HostWindow::set_scaling_filter(int) {}
+int HostWindow::scaling_filter() const { return 0; }
+void HostWindow::set_screen_effect(int, int) {}
+int HostWindow::screen_effect() const { return 0; }
+int HostWindow::screen_effect_strength() const { return 35; }
+HostWindow::FilterStats HostWindow::filter_stats() const { return {}; }
 void HostWindow::set_audio_enabled(bool /*enabled*/) {}
 void HostWindow::set_game_paused(bool /*paused*/) {}
 bool HostWindow::audio_enabled() const { return false; }

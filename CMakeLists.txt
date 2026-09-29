@@ -326,6 +326,7 @@ add_library(gbarecomp_runtime STATIC
     src/runtime/host_platform.cpp
     src/runtime/host_window.cpp
     src/runtime/color_lut.cpp
+    src/runtime/presentation_filters.cpp
     src/runtime/asset_picker.cpp
     # Production abort stubs for runtime_dispatch_miss +
     # runtime_unimplemented_op. Test binaries that link only

@@ -80,6 +80,9 @@ struct RunOptions {
     std::uint16_t host_presentation_width = 0;
     HostFrameRenderer host_frame_renderer = nullptr;
     void (*host_frame_reset)() = nullptr; // startup, snapshot load and rewind
+    // Optional host-only aspect presets. Guest scanout remains native. The
+    // callback runs at a completed-frame boundary, never during guest drawing.
+    void (*host_frame_set_width)(std::uint16_t) = nullptr;
 
     // Host-window presentation policy, independent of extended guest view.
     // When true the player may freely reshape a window while SDL keeps the
@@ -231,6 +234,12 @@ struct RunOptions {
     // Lowercase SHA-1 of the only accepted patched output for a corpus built
     // against one translation release. Null leaves data-only patches open.
     const char* launcher_required_patch_sha1 = nullptr;
+    // A host shipping separate source/target engines can accept both. The host
+    // must route the effective verified image to its matching generated code.
+    bool launcher_allow_unpatched = false;
+    const char* launcher_unpatched_label = nullptr;
+    const char* launcher_patched_label = nullptr;
+    const char* launcher_patched_save_path = nullptr;
     // Keep an implemented extended-view mode out of the public launcher while
     // it is still being profiled. Explicit CLI/TOML opt-ins remain available.
     // Defaults true so existing games (including MMZ) retain today's UI.
@@ -251,6 +260,9 @@ struct RunOptions {
     bool launcher_default_sharp_filter = false;
     bool launcher_expose_affine_filter = false;
     bool launcher_default_affine_filter = false;
+    // Additive opt-in presentation choices. Off preserves the original image.
+    bool launcher_expose_smooth_filter = false;
+    bool launcher_expose_screen_effects = false;
     // >240 offers the launcher's 16:9 widescreen toggle, mapped to
     // --view-width <this> when enabled. 0/240 = no widescreen surface shown.
     // Games with MULTIPLE extended widths use the aspect vocabulary below
@@ -265,6 +277,8 @@ struct RunOptions {
     const char* const*   launcher_aspect_labels = nullptr;
     const std::uint16_t* launcher_aspect_view_widths = nullptr;
     int                  launcher_num_aspects = 0;
+    bool                 launcher_aspects_host_only = false;
+    int                  launcher_default_aspect = 0;
     // Box-art image path relative to the assets dir staged next to the exe;
     // null => the launcher's default "assets/img/boxart.tga". Multi-variant
     // repos stage one file per variant (e.g. "assets/img/boxart_firered.tga").
