@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "color_lut.h"
+#include "screen_models.h"
 #include "presentation_layout.h"
 #include "presentation_filters.h"
 #if defined(GBARECOMP_RUNTIME_UI)
@@ -357,9 +358,9 @@ struct Backend {
     int           audio_direct_probe_peak = 0;
     Uint32        audio_direct_min_bytes = UINT32_MAX;
     Uint32        audio_direct_max_bytes = 0;
-    // Present-time screen-color simulation. Built once from
-    // GBARECOMP_SCREEN; default Raw = exact passthrough (no copy, no
-    // grading), so default behavior is byte-identical to upstream.
+    // Present-time colour simulation, rebuilt only on a model change.
+    // Raw is exact passthrough: no copy or colour grading.
+    int screen_model = 0;
     std::unique_ptr<runtime::ColorLut> color_lut;
     std::vector<uint8_t> graded_fb;  // scratch RGB888 (base_w*base_h*3)
 #if defined(GBARECOMP_RUNTIME_UI)
@@ -387,6 +388,11 @@ struct Backend {
     bool textures_lost = false;
     runtime::SmoothScaler smooth;
     HostWindow::FilterStats filters;
+    bool profile_smooth = [] {
+        const char* value = std::getenv("GBARECOMP_SMOOTH_PROFILE");
+        return value && !std::strcmp(value,"1");
+    }();
+    Uint64 smooth_scale_ticks=0, smooth_upload_ticks=0, smooth_profile_calls=0;
 
     // ---- rebindable input (see HostWindow::load_input_config) --------------
     // GBA KEYINPUT bit (0..9) per bound SDL scancode; seeded from the
@@ -461,9 +467,19 @@ SDL_Texture* prepare_smooth(Backend* b, const uint8_t* rgb) {
 #endif
         }
     }
-    if (b->smooth_texture && b->smooth.scale2x(rgb, b->base_w, b->base_h) &&
-        SDL_UpdateTexture(b->smooth_texture, nullptr, b->smooth.output().data(), b->base_w * 8) == 0)
-        return b->smooth_texture;
+    if (b->smooth_texture) {
+        const auto before = b->profile_smooth ? SDL_GetPerformanceCounter() : 0;
+        const bool scaled = b->smooth.scale2x(rgb, b->base_w, b->base_h);
+        const auto after = b->profile_smooth ? SDL_GetPerformanceCounter() : 0;
+        const bool uploaded = scaled && SDL_UpdateTexture(b->smooth_texture, nullptr,
+            b->smooth.output().data(), b->base_w * 8) == 0;
+        if (b->profile_smooth) {
+            b->smooth_scale_ticks += after-before;
+            b->smooth_upload_ticks += SDL_GetPerformanceCounter()-after;
+            ++b->smooth_profile_calls;
+        }
+        if (uploaded) return b->smooth_texture;
+    }
     b->smooth_failed = true; // Retry only after a settings/size change.
     std::fprintf(stderr, "[presentation] Smooth 2x unavailable; using original scaling: %s\n", SDL_GetError());
     return nullptr;
@@ -1401,7 +1417,9 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
         }
     }
 
-    b->color_lut = std::make_unique<runtime::ColorLut>(resolve_color_settings(screen));
+    const auto colour_settings = resolve_color_settings(screen);
+    b->screen_model = static_cast<int>(colour_settings.screen);
+    b->color_lut = std::make_unique<runtime::ColorLut>(colour_settings);
     if (!b->color_lut->is_passthrough())
         b->graded_fb.resize(static_cast<std::size_t>(base_w) * base_h * 3);
 
@@ -1583,6 +1601,12 @@ void HostWindow::close() {
             (unsigned long long)b->filters.smooth_frames, (unsigned long long)b->filters.effect_frames,
             (unsigned long long)b->filters.fallback_frames, b->filters.preparation_ms);
     }
+    if (b->smooth_profile_calls) {
+        const double to_ms=1000.0/SDL_GetPerformanceFrequency()/b->smooth_profile_calls;
+        std::fprintf(stderr,"[smooth-profile] calls=%llu scale_ms=%.4f upload_ms=%.4f\n",
+            (unsigned long long)b->smooth_profile_calls,
+            b->smooth_scale_ticks*to_ms,b->smooth_upload_ticks*to_ms);
+    }
     if (b->texture)   SDL_DestroyTexture(b->texture);
     if (b->renderer)  SDL_DestroyRenderer(b->renderer);
     if (b->window)    SDL_DestroyWindow(b->window);
@@ -1668,6 +1692,7 @@ void HostWindow::present(const uint8_t* rgb888) {
     if (b->color_lut && !b->color_lut->is_passthrough() &&
         b->graded_fb.size() == static_cast<std::size_t>(b->base_w) * b->base_h * 3u) {
         b->color_lut->map_rgb888(rgb888, b->graded_fb.data(), b->base_w, b->base_h);
+        ++b->filters.colour_frames;
         rgb888 = b->graded_fb.data();
     }
     SDL_UpdateTexture(b->texture, nullptr, rgb888, b->base_w * 3);
@@ -2006,6 +2031,34 @@ int HostWindow::screen_effect() const {
 
 int HostWindow::screen_effect_strength() const {
     return open_ && impl_ ? static_cast<const Backend*>(impl_)->effect_strength : 35;
+}
+
+bool HostWindow::set_screen_model(int model, const std::function<bool()>& persist) {
+    if (!open_ || !impl_ || !valid_screen_model(model)) return false;
+    auto* b = static_cast<Backend*>(impl_);
+    try {
+        if (model == b->screen_model) return !persist || persist();
+        runtime::ColorSettings settings;
+        if (!runtime::screen_kind_from_name(screen_model_tokens[model], settings.screen)) return false;
+        auto lut = std::make_unique<runtime::ColorLut>(settings);
+        std::vector<uint8_t> scratch;
+        if (!lut->is_passthrough())
+            scratch.resize(static_cast<std::size_t>(b->base_w) * b->base_h * 3u);
+        if (persist && !persist()) return false;
+        // Swaps are non-throwing; no partial display change after persistence.
+        b->color_lut.swap(lut);
+        b->graded_fb.swap(scratch);
+        b->screen_model = model;
+        // Texture uploads and Smooth's input cache observe the newly graded
+        // source next present, including paused re-presentation of the same frame.
+        std::fprintf(stderr, "[presentation] screen=%s source=%dx%d\n",
+            screen_model_tokens[model], b->base_w, b->base_h);
+        return true;
+    } catch (...) { return false; }
+}
+
+int HostWindow::screen_model() const {
+    return open_ && impl_ ? static_cast<const Backend*>(impl_)->screen_model : 0;
 }
 
 HostWindow::FilterStats HostWindow::filter_stats() const {
@@ -2408,6 +2461,8 @@ int HostWindow::scaling_filter() const { return 0; }
 void HostWindow::set_screen_effect(int, int) {}
 int HostWindow::screen_effect() const { return 0; }
 int HostWindow::screen_effect_strength() const { return 35; }
+bool HostWindow::set_screen_model(int, const std::function<bool()>&) { return false; }
+int HostWindow::screen_model() const { return 0; }
 HostWindow::FilterStats HostWindow::filter_stats() const { return {}; }
 void HostWindow::set_audio_enabled(bool /*enabled*/) {}
 void HostWindow::set_game_paused(bool /*paused*/) {}

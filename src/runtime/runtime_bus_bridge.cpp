@@ -12,6 +12,7 @@
 #include "../gba/gba_irq.h"
 #include "../gba/gba_m4a.h"
 #include "../gba/gba_ppu.h"
+#include "ram_write_override.h"
 
 #ifdef GBA_COSIM
 #include "../debug/cosim.h"   // cosim_on_tick() — first-divergence checkpoint hook
@@ -398,6 +399,8 @@ static inline bool is_idle_safe_read(uint32_t addr) {
     return false;  // MMIO, palette, VRAM, OAM, save/flash, open-bus, unmapped
 }
 
+gbarecomp::RamWriteOverride gbarecomp::ram_write_override = nullptr;
+
 static inline uint32_t apply_bus_read_override(uint32_t addr, uint32_t width,
                                                uint32_t value) {
     uint32_t overridden = value;
@@ -451,6 +454,7 @@ extern "C" uint8_t bus_read_u8(uint32_t addr) {
 }
 
 extern "C" void bus_write_u32(uint32_t addr, uint32_t val) {
+    val = gbarecomp::mapped_ram_write(gbarecomp::ram_write_override, g_cpu.R[15], addr, 4, val);
     bool io = is_io_addr(addr);
     if (io) runtime_mmio_catch_up();
     if (gbarecomp::g_active_bus) gbarecomp::g_active_bus->write32(addr, val);
@@ -459,6 +463,7 @@ extern "C" void bus_write_u32(uint32_t addr, uint32_t val) {
 }
 
 extern "C" void bus_write_u16(uint32_t addr, uint16_t val) {
+    val = static_cast<uint16_t>(gbarecomp::mapped_ram_write(gbarecomp::ram_write_override, g_cpu.R[15], addr, 2, val));
     bool io = is_io_addr(addr);
     if (io) runtime_mmio_catch_up();
     if (gbarecomp::g_active_bus) gbarecomp::g_active_bus->write16(addr, val);
@@ -467,6 +472,7 @@ extern "C" void bus_write_u16(uint32_t addr, uint16_t val) {
 }
 
 extern "C" void bus_write_u8(uint32_t addr, uint8_t val) {
+    val = static_cast<uint8_t>(gbarecomp::mapped_ram_write(gbarecomp::ram_write_override, g_cpu.R[15], addr, 1, val));
     bool io = is_io_addr(addr);
     if (io) runtime_mmio_catch_up();
     if (gbarecomp::g_active_bus) gbarecomp::g_active_bus->write8(addr, val);

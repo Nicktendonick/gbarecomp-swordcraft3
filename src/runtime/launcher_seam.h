@@ -33,6 +33,7 @@
 // flags, stripped before run_game() parses the args.
 
 #pragma once
+#include "screen_models.h"
 
 #if defined(RECOMP_LAUNCHER)
 
@@ -292,9 +293,7 @@ inline bool pull_solar_settings(const T& settings, S* dst) {
 
 // gbarecomp's screen-model tokens, in the launcher's kGbaScreenKindNames
 // index order (Raw/Unlit/Frontlit/Backlit/Classic).
-inline const char* const kScreenTokens[5] = {
-    "raw", "unlit", "frontlit", "backlit", "classic"
-};
+inline const auto& kScreenTokens = gbarecomp::screen_model_tokens;
 
 inline int screen_token_to_index(const std::string& tok) {
     for (int i = 0; i < 5; ++i)
@@ -1059,6 +1058,10 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     gi.rom_patch_supported =
         opts.launcher_enable_rom_patches && !rom_patch_cache_dir.empty();
     gi.rom_patch_note = opts.launcher_rom_patch_note;
+    gi.builtin_mods = opts.launcher_builtin_mods;
+    gi.builtin_mod_count = opts.launcher_builtin_mod_count;
+    gi.graphics_presets = opts.graphics_presets;
+    gi.graphics_preset_count = opts.graphics_preset_count;
     gi.rom_patch_cache_dir = rom_patch_cache_dir.c_str();
     gi.rom_patch_required_sha1 = opts.launcher_required_patch_sha1;
     gi.rom_patch_allow_unpatched = opts.launcher_allow_unpatched;

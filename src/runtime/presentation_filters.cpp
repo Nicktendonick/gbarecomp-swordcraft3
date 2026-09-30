@@ -1,4 +1,5 @@
 #include "presentation_filters.h"
+#include "presentation_simd.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -114,6 +115,9 @@ bool SmoothScaler::scale2x(const std::uint8_t* rgb, int width, int height) noexc
     }
     try {
         output_.resize(pixels * 4);
+#if defined(GBARECOMP_PRESENTATION_SSE2)
+        packed_.resize(static_cast<std::size_t>(width + 2) * (height + 2));
+#endif
     } catch (const std::bad_alloc&) {
         output_.clear();
         return false;
@@ -127,10 +131,47 @@ bool SmoothScaler::scale2x(const std::uint8_t* rgb, int width, int height) noexc
         const auto offset = (static_cast<std::size_t>(y) * width + x) * 3;
         return {rgb[offset], rgb[offset + 1], rgb[offset + 2]};
     };
+#if defined(GBARECOMP_PRESENTATION_SSE2)
+    const int stride = width + 2;
+    for (int y = 0; y < height; ++y) {
+        auto* row = packed_.data() + static_cast<std::size_t>(y + 1) * stride;
+        const auto* input = rgb + static_cast<std::size_t>(y) * width * 3;
+        for (int x = 0; x < width; ++x)
+            row[x + 1] = (std::uint32_t(input[x*3]) << 16) |
+                         (std::uint32_t(input[x*3+1]) << 8) | input[x*3+2];
+        row[0] = row[1]; row[width+1] = row[width];
+    }
+    std::copy_n(packed_.data()+stride,stride,packed_.data());
+    std::copy_n(packed_.data()+static_cast<std::size_t>(height)*stride,stride,
+                packed_.data()+static_cast<std::size_t>(height+1)*stride);
+#endif
     for (int y = 0; y < height; ++y) {
         const int above = std::max(y - 1, 0);
         const int below = std::min(y + 1, height - 1);
-        for (int x = 0; x < width; ++x) {
+        int x = 0;
+#if defined(GBARECOMP_PRESENTATION_SSE2)
+        using namespace presentation_simd;
+        const auto load = [] (const std::uint32_t* p) {
+            return _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+        };
+        for (; x + 4 <= width; x += 4) {
+            const auto* p = packed_.data() + static_cast<std::size_t>(y+1)*stride+x+1;
+            const auto c=load(p), h0=load(p-1), h1=load(p+1), v0=load(p-stride), v1=load(p+stride);
+            const auto hc0=byte_distance(h0,c), hc1=byte_distance(h1,c);
+            const auto vc0=byte_distance(v0,c), vc1=byte_distance(v1,c);
+            const auto tl=quadrant(c,h0,v0,load(p-stride-1),hc0,vc0);
+            const auto tr=quadrant(c,h1,v0,load(p-stride+1),hc1,vc0);
+            const auto bl=quadrant(c,h0,v1,load(p+stride-1),hc0,vc1);
+            const auto br=quadrant(c,h1,v1,load(p+stride+1),hc1,vc1);
+            auto* top=output_.data()+static_cast<std::size_t>(y*2)*output_width+x*2;
+            auto* bottom=top+output_width;
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(top),_mm_unpacklo_epi32(tl,tr));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(top+4),_mm_unpackhi_epi32(tl,tr));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(bottom),_mm_unpacklo_epi32(bl,br));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(bottom+4),_mm_unpackhi_epi32(bl,br));
+        }
+#endif
+        for (; x < width; ++x) {
             const int left = std::max(x - 1, 0);
             const int right = std::min(x + 1, width - 1);
             const Rgb center = sample(x, y);

@@ -37,6 +37,9 @@ public:
 
 private:
     std::vector<std::uint32_t> output_;
+    // Current-call RGB32 scratch with duplicated edge samples. Reused storage,
+    // never retained frame content: every entry is rebuilt before it is read.
+    std::vector<std::uint32_t> packed_;
     int width_ = 0;
     int height_ = 0;
 };

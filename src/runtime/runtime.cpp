@@ -20,6 +20,7 @@
 // step_once() becomes a real `runtime_dispatch` driver.
 
 #include "runtime.h"
+#include "ram_write_override.h"
 #include "runtime_menu_preferences.h"
 #include "presentation_preferences.h"
 #include "view_config.h"
@@ -54,6 +55,7 @@
 #include "ws_sidecar.h"
 #if defined(GBARECOMP_RUNTIME_UI)
 #include "recomp_runtime_ui.h"
+#include "recomp_graphics_preset.h"
 #endif
 
 #include <algorithm>
@@ -219,6 +221,8 @@ struct Args {
 #define GBARECOMP_UI_KEY_FAST_FORWARD_SPEED "assist.fast_forward_speed"
 #define GBARECOMP_UI_KEY_REWIND          "assist.rewind"
 #define GBARECOMP_UI_KEY_SCALING         "graphics.scaling_filter"
+#define GBARECOMP_UI_KEY_PRESET          "graphics.preset"
+#define GBARECOMP_UI_KEY_SCREEN_MODEL    "graphics.screen_model"
 #define GBARECOMP_UI_KEY_SCREEN_EFFECT   "graphics.screen_effect"
 #define GBARECOMP_UI_KEY_EFFECT_STRENGTH "graphics.screen_effect_strength"
 #define GBARECOMP_UI_KEY_HOST_ASPECT     "graphics.host_aspect"
@@ -252,6 +256,24 @@ struct RuntimeUiContext {
     const RunOptions* opts = nullptr;
 };
 
+bool runtime_presets_supported(const RunOptions* opts) {
+    if (!opts || !opts->graphics_presets || opts->graphics_preset_count < 1 ||
+        opts->graphics_preset_count > 16) return false;
+    for (int i = 0; i < opts->graphics_preset_count; ++i) {
+        const auto& p = opts->graphics_presets[i];
+        if (!recomp_graphics_preset_valid(&p) || (p.scaling == 2 && !opts->launcher_expose_sharp_filter) ||
+            (p.scaling == 3 && !opts->launcher_expose_smooth_filter) ||
+            (p.effect && !opts->launcher_expose_screen_effects)) return false;
+    }
+    return true;
+}
+
+int runtime_preset_index(const RuntimeUiContext* c) {
+    if (!c || !c->window || !runtime_presets_supported(c->opts)) return -1;
+    return recomp_graphics_preset_match(c->opts->graphics_presets, c->opts->graphics_preset_count,
+        c->window->scaling_filter(), c->window->screen_effect(), c->window->screen_effect_strength());
+}
+
 int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
     auto* c = static_cast<RuntimeUiContext*>(opaque);
     if (!c || !c->window || !item || !out) return 0;
@@ -270,6 +292,8 @@ int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_VIEW_MODE) == 0) *out = c->view_mode;
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER) == 0) *out = c->window->linear_filter();
     else if (std::strcmp(item->key, GBARECOMP_UI_KEY_SCALING) == 0) *out = c->window->scaling_filter();
+    else if (std::strcmp(item->key, GBARECOMP_UI_KEY_PRESET) == 0) *out = runtime_preset_index(c);
+    else if (std::strcmp(item->key, GBARECOMP_UI_KEY_SCREEN_MODEL) == 0) *out = c->window->screen_model();
     else if (std::strcmp(item->key, GBARECOMP_UI_KEY_SCREEN_EFFECT) == 0) *out = c->window->screen_effect();
     else if (std::strcmp(item->key, GBARECOMP_UI_KEY_EFFECT_STRENGTH) == 0) *out = c->window->screen_effect_strength();
     else if (std::strcmp(item->key, GBARECOMP_UI_KEY_HOST_ASPECT) == 0) *out = c->host_aspect_index;
@@ -297,6 +321,26 @@ int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
 int runtime_ui_set(void* opaque, const RecompRuntimeUiItem* item, int value) {
     auto* c = static_cast<RuntimeUiContext*>(opaque);
     if (!c || !c->window || !item) return 0;
+    if (std::strcmp(item->key, GBARECOMP_UI_KEY_SCREEN_MODEL) == 0) {
+        const bool ok = c->window->set_screen_model(value, [&] {
+            return save_screen_model_preference(c->presentation_preferences_path, value);
+        });
+        if (!ok) std::fprintf(stderr, "[presentation] Could not apply/save screen model; previous model retained.\n");
+        return ok;
+    }
+    if (std::strcmp(item->key, GBARECOMP_UI_KEY_PRESET) == 0) {
+        if (!runtime_presets_supported(c->opts) || value < 0 || value >= c->opts->graphics_preset_count) return 0;
+        const auto& p = c->opts->graphics_presets[value];
+        // Persist the whole recipe first, then update presentation together.
+        // Failed saves leave the current picture and settings untouched.
+        if (!save_presentation_preferences(c->presentation_preferences_path, p.scaling, p.effect, p.strength)) {
+            std::fprintf(stderr, "[presentation] Could not save graphics preset; previous values retained.\n");
+            return 0;
+        }
+        c->window->set_scaling_filter(p.scaling);
+        c->window->set_screen_effect(p.effect, p.strength);
+        return 1;
+    }
     if (std::strcmp(item->key, GBARECOMP_UI_KEY_HOST_ASPECT) == 0) {
         if (!c->opts || !c->opts->launcher_aspects_host_only || !c->opts->host_frame_set_width ||
             !save_host_aspect_preference(c->presentation_preferences_path, value, c->opts->launcher_num_aspects)) return 0;
@@ -1275,6 +1319,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     g_runtime_fn_entry_hook = nullptr;
     g_runtime_thumb_alu_imm_override = nullptr;
     g_runtime_bus_read_override = nullptr;
+    ram_write_override = nullptr;
     Args args;
 
     // Seed built-in defaults from the caller (the per-game runner).
@@ -1610,6 +1655,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // this array, so it must outlive the menu — hence function scope here
     // rather than inside the construction block below.
     std::vector<RecompRuntimeUiItem> runtime_ui_extras;
+    std::vector<const char*> runtime_preset_names, runtime_preset_descriptions;
 #endif
     if (args.resize_view && !args.quiet) {
         std::fprintf(stderr,
@@ -2889,6 +2935,21 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             RECOMP_RUNTIME_UI_STANDARD_AUDIO |
             RECOMP_RUNTIME_UI_STANDARD_VOLUME |
             RECOMP_RUNTIME_UI_STANDARD_RESUME;
+        if (runtime_presets_supported(&opts)) {
+            for (int i = 0; i < opts.graphics_preset_count; ++i) {
+                runtime_preset_names.push_back(opts.graphics_presets[i].name);
+                runtime_preset_descriptions.push_back(opts.graphics_presets[i].description);
+            }
+            RecompRuntimeUiItem item{};
+            item.key = GBARECOMP_UI_KEY_PRESET; item.section = "Graphics"; item.label = "Graphics preset";
+            item.description = "Custom filter combination. Choose a preset or fine-tune below. Presets leave aspect ratio, colour model and window size unchanged.";
+            item.type = RECOMP_RUNTIME_UI_CHOICE; item.minimum = 0;
+            item.maximum = opts.graphics_preset_count - 1; item.step = 1;
+            item.choices = runtime_preset_names.data(); item.choice_count = runtime_preset_names.size();
+            item.unknown_choice_label = "Custom";
+            item.choice_descriptions = runtime_preset_descriptions.data();
+            runtime_ui_extras.push_back(item);
+        }
         if (host_aspects) {
             runtime_ui_context.host_aspect_index = args.host_aspect;
             RecompRuntimeUiItem item{};
@@ -2910,6 +2971,15 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             item.type = RECOMP_RUNTIME_UI_CHOICE; item.minimum = 0;
             item.maximum = opts.launcher_expose_smooth_filter ? 3 : 2; item.step = 1;
             item.choices = scaling_choices; item.choice_count = item.maximum + 1;
+            runtime_ui_extras.push_back(item);
+        }
+        {
+            RecompRuntimeUiItem item{};
+            item.key = GBARECOMP_UI_KEY_SCREEN_MODEL; item.section = "Graphics"; item.label = "Screen model";
+            item.description = "Changes game colours immediately, including while paused. Saved for the launcher and Reset Game.";
+            item.type = RECOMP_RUNTIME_UI_CHOICE; item.minimum = 0; item.maximum = screen_model_count - 1; item.step = 1;
+            item.choices = screen_model_labels; item.choice_count = screen_model_count;
+            item.choice_descriptions = screen_model_descriptions;
             runtime_ui_extras.push_back(item);
         }
         if (opts.launcher_expose_screen_effects) {
@@ -3298,7 +3368,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     action == "menu_close" || action == "menu_cancel" || action == "menu_confirm" || action == "menu_probe";
                 action_valid = action_valid || action == "menu_auto_on" || action == "menu_auto_off";
                 if (action.rfind("menu_scaling=", 0) == 0 || action.rfind("menu_effect=", 0) == 0 ||
-                    action.rfind("menu_strength=", 0) == 0 || action.rfind("menu_aspect=", 0) == 0) {
+                    action.rfind("menu_strength=", 0) == 0 || action.rfind("menu_aspect=", 0) == 0 ||
+                    action.rfind("menu_preset=", 0) == 0 || action.rfind("menu_screen=", 0) == 0) {
                     int value = 0;
                     action_valid = parse_int(action.c_str() + action.find('=') + 1, &value);
                 }
@@ -3381,10 +3452,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                             RecompRuntimeUiItem preference{};
                             preference.key = RECOMP_RUNTIME_UI_KEY_PAUSE_ON_OPEN;
                             runtime_ui_set(&runtime_ui_context, &preference, key == "auto_on");
-                        } else if (key.rfind("scaling=", 0) == 0 || key.rfind("effect=", 0) == 0 || key.rfind("strength=", 0) == 0 || key.rfind("aspect=", 0) == 0) {
+                        } else if (key.rfind("scaling=", 0) == 0 || key.rfind("effect=", 0) == 0 || key.rfind("strength=", 0) == 0 || key.rfind("aspect=", 0) == 0 || key.rfind("preset=", 0) == 0 || key.rfind("screen=", 0) == 0) {
                             RecompRuntimeUiItem preference{};
                             preference.key = key.rfind("scaling=", 0) == 0 ? GBARECOMP_UI_KEY_SCALING :
                                 key.rfind("effect=", 0) == 0 ? GBARECOMP_UI_KEY_SCREEN_EFFECT :
+                                key.rfind("preset=", 0) == 0 ? GBARECOMP_UI_KEY_PRESET :
+                                key.rfind("screen=", 0) == 0 ? GBARECOMP_UI_KEY_SCREEN_MODEL :
                                 key.rfind("aspect=", 0) == 0 ? GBARECOMP_UI_KEY_HOST_ASPECT : GBARECOMP_UI_KEY_EFFECT_STRENGTH;
                             int value = 0;
                             if (parse_int(key.c_str() + key.find('=') + 1, &value))
@@ -3398,6 +3471,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                             recomp_runtime_ui_confirmation_pending(ui), win.audio_enabled(), runtime_ui_context.menu_preferences.pause_on_open());
                         std::fprintf(stderr, "[runtime-filters] scaling=%d effect=%d strength=%d\n",
                             win.scaling_filter(), win.screen_effect(), win.screen_effect_strength());
+                        const int preset = runtime_preset_index(&runtime_ui_context);
+                        std::fprintf(stderr, "[runtime-preset] index=%d name=%s\n", preset,
+                            preset >= 0 ? opts.graphics_presets[preset].name : "Custom");
+                        std::fprintf(stderr, "[runtime-screen] index=%d name=%s colour_frames=%llu\n",
+                            win.screen_model(), screen_model_tokens[win.screen_model()],
+                            (unsigned long long)win.filter_stats().colour_frames);
                         if (host_aspects) std::fprintf(stderr, "[runtime-aspect] selected=%d applied=%d host=%u guest=%u\n",
                             runtime_ui_context.host_aspect_index, args.host_aspect, host_surface.width(ppu), ppu.render_width());
                     }

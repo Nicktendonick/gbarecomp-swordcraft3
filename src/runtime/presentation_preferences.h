@@ -13,6 +13,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include "screen_models.h"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -92,16 +93,22 @@ inline bool replace_atomically(const std::filesystem::path& destination,
 }
 } // namespace presentation_preferences_detail
 
-// Update only the specified integer keys in the launcher's [Launcher] section.
+// Update only the specified single-line keys in the launcher's [Launcher] section.
 // Callers validate their own ranges. The path preserves Unicode; an empty path
 // deliberately means session-only.
 // Invalid arguments, unreadable/malformed input, and write errors leave the
 // existing file untouched. The caller must serialize its own settings writers.
-inline bool update_launcher_preferences(const std::filesystem::path& path,
+inline bool update_launcher_text_preferences(const std::filesystem::path& path,
                                        const std::vector<std::string>& keys,
-                                       const std::vector<int>& values) {
+                                       const std::vector<std::string>& values) {
     using namespace presentation_preferences_detail;
     if (keys.empty() || keys.size() != values.size()) return false;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (keys[i].empty() || keys[i].find_first_of("=\r\n;#[]") != std::string::npos ||
+            keys[i].find('\0') != std::string::npos ||
+            values[i].find_first_of("\r\n;#") != std::string::npos ||
+            values[i].find('\0') != std::string::npos) return false;
+    }
     if (path.empty()) return true;
     try {
         const auto& destination = path;
@@ -173,7 +180,7 @@ inline bool update_launcher_preferences(const std::filesystem::path& path,
                 size_t suffix_start = comment == std::string::npos ? line.body.size() : comment;
                 while (suffix_start > begin && (line.body[suffix_start - 1] == ' ' ||
                                                 line.body[suffix_start - 1] == '\t')) --suffix_start;
-                line.body = line.body.substr(0, begin) + std::to_string(values[key_index]) +
+                line.body = line.body.substr(0, begin) + values[key_index] +
                             line.body.substr(suffix_start);
                 found[key_index] = true;
             }
@@ -181,7 +188,7 @@ inline bool update_launcher_preferences(const std::filesystem::path& path,
         std::string additions;
         if (!saw_launcher) additions = "[Launcher]" + newline;
         for (size_t index = 0; index < keys.size(); ++index)
-            if (!found[index]) additions += keys[index] + " = " + std::to_string(values[index]) + newline;
+            if (!found[index]) additions += keys[index] + " = " + values[index] + newline;
         std::string updated;
         for (size_t index = 0; index <= lines.size(); ++index) {
             if (index == insert_at && !additions.empty()) {
@@ -196,6 +203,51 @@ inline bool update_launcher_preferences(const std::filesystem::path& path,
         return false;
     }
 }
+inline bool update_launcher_preferences(const std::filesystem::path& path,
+                                       const std::vector<std::string>& keys,
+                                       const std::vector<int>& values) {
+    std::vector<std::string> text;
+    for (int value : values) text.push_back(std::to_string(value));
+    return update_launcher_text_preferences(path, keys, text);
+}
+
+inline bool save_screen_model_preference(const std::filesystem::path& path, int model) {
+    return valid_screen_model(model) &&
+        update_launcher_text_preferences(path, {"screen"}, {screen_model_tokens[model]});
+}
+
+inline std::optional<int> read_screen_model_preference(const std::filesystem::path& path) {
+    try {
+        std::ifstream input(path, std::ios::binary);
+        if (!input) return {};
+        std::optional<int> result;
+        bool first = true, section = false;
+        size_t bytes = 0;
+        std::string line;
+        while (std::getline(input, line)) {
+            bytes += line.size();
+            if (bytes > 1024 * 1024 || line.find('\0') != std::string::npos) return {};
+            if (first && line.compare(0, 3, "\xef\xbb\xbf") == 0) line.erase(0, 3);
+            first = false;
+            line = presentation_preferences_detail::trim(line.substr(0, line.find_first_of(";#")));
+            if (line.empty()) continue;
+            if (line[0] == '[') {
+                if (line.back() != ']' || line.find(']') != line.size() - 1) return {};
+                section = line == "[Launcher]";
+                continue;
+            }
+            const auto equal = line.find('=');
+            if (!section || equal == std::string::npos ||
+                presentation_preferences_detail::trim(line.substr(0, equal)) != "screen") continue;
+            if (result) return {}; // ambiguous duplicate, even if both values are the same
+            const int model = screen_model_from_token(presentation_preferences_detail::trim(line.substr(equal + 1)));
+            if (!valid_screen_model(model)) return {};
+            result = model;
+        }
+        return input.bad() ? std::optional<int>{} : result;
+    } catch (...) { return {}; }
+}
+
 inline bool save_presentation_preferences(const std::filesystem::path& path, int scaling,
                                          int effect, int strength) {
     if (scaling < 0 || scaling > 3 || effect < 0 || effect > 2 || strength < 0 || strength > 100)

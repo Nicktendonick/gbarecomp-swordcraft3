@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
 struct RecompRuntimeUi;
 
@@ -93,9 +94,15 @@ public:
     void set_screen_effect(int mode, int strength);
     int screen_effect() const;
     int screen_effect_strength() const;
+    // Colour model: 0 Raw, 1 Unlit, 2 Frontlit, 3 Backlit, 4 Classic.
+    // Build resources first; optional persistence must succeed before committing.
+    // Invalid selection, allocation or persistence failure leaves the model intact.
+    bool set_screen_model(int model, const std::function<bool()>& persist = {});
+    int screen_model() const;
     struct FilterStats {
         std::uint64_t frames = 0, sharp_frames = 0, smooth_frames = 0;
         std::uint64_t effect_frames = 0, fallback_frames = 0;
+        std::uint64_t colour_frames = 0;
         double preparation_ms = 0;
     };
     FilterStats filter_stats() const;

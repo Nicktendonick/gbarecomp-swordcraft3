@@ -11,6 +11,9 @@
 #include <cstdint>
 #include "host_frame.h"
 
+struct RecompLauncherCBuiltinMod;
+struct RecompGraphicsPreset;
+
 namespace gbarecomp {
 
 // Read-only state published to an opted-in game's extended-view policy once
@@ -227,6 +230,9 @@ struct RunOptions {
     // Patched images are generated under the executable's mods/rom-patches
     // cache; the original ROM and patch file are never modified.
     bool launcher_enable_rom_patches = false;
+    // Optional host-owned switches displayed even without archive mod support.
+    const RecompLauncherCBuiltinMod* launcher_builtin_mods = nullptr;
+    int launcher_builtin_mod_count = 0;
     const char* launcher_rom_patch_note = nullptr;
     // Translation-specific builds can verify a stock source independently
     // from builtin_rom_sha1 (the target image the generated corpus expects).
@@ -263,6 +269,8 @@ struct RunOptions {
     // Additive opt-in presentation choices. Off preserves the original image.
     bool launcher_expose_smooth_filter = false;
     bool launcher_expose_screen_effects = false;
+    const RecompGraphicsPreset* graphics_presets = nullptr;
+    int graphics_preset_count = 0;
     // >240 offers the launcher's 16:9 widescreen toggle, mapped to
     // --view-width <this> when enabled. 0/240 = no widescreen surface shown.
     // Games with MULTIPLE extended widths use the aspect vocabulary below
