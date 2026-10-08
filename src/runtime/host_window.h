@@ -172,9 +172,11 @@ public:
         bool     toggle_fps = false;
         // Developer-only visible debugger controls, enabled by
         // GBARECOMP_VISIBLE_DEBUGGER. F2 restores composite; F3..F7 isolate
-        // BG0..BG3/OBJ; F8 pauses; F9 advances one frame; F10 exports evidence.
+        // BG0..BG3/OBJ; F8 pauses; F9 advances one frame.
         int      debug_layer_mask = -1;
         bool     debug_step_frame = false;
+        // F10 exports evidence in debugger mode OR when a launcher supplies
+        // a nonempty GBARECOMP_DEBUG_CAPTURE_DIR. It does not enable F2..F9.
         bool     debug_export = false;
         // Horizontal mouse velocity while the left button is held. The runtime
         // maps this host-neutral delta onto cartridge gyroscope sample units.

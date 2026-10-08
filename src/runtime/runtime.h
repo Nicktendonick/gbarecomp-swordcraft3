@@ -296,6 +296,7 @@ struct RunOptions {
     const char* launcher_backdrop = nullptr;
     const char* launcher_tagline = nullptr;
     bool launcher_sidebar = false;
+    bool launcher_organized_settings = false;
     const char* launcher_settings_note = nullptr;
 };
 

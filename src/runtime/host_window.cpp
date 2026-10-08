@@ -1,6 +1,7 @@
 // host_window.cpp — SDL2-backed window. Stubs out when SDL2 isn't found.
 
 #include "host_window.h"
+#include "debug_capture_policy.h"
 
 #include <algorithm>
 #include <array>
@@ -21,6 +22,7 @@
 #include "presentation_filters.h"
 #if defined(GBARECOMP_RUNTIME_UI)
 #include "recomp_runtime_ui.h"
+#include "runtime_menu_input.h"
 #endif
 
 #if defined(GBARECOMP_HAVE_SDL2)
@@ -1083,9 +1085,11 @@ void runtime_imgui_render(Backend* b) {
 
 bool runtime_ui_event(RecompRuntimeUi* ui, const SDL_Event& e) {
     if (!ui) return false;
-    if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_ESCAPE &&
-        !e.key.repeat && !recomp_runtime_ui_is_open(ui)) {
-        recomp_runtime_ui_open(ui);
+    if ((e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) &&
+        e.key.keysym.scancode == SDL_SCANCODE_ESCAPE) {
+        if (e.type == SDL_KEYDOWN && !e.key.repeat) runtime_menu_escape(ui);
+        // Swallow releases and repeats even after Resume closes the UI, or
+        // they can leak into the legacy no-menu Escape-to-quit shortcut.
         return true;
     }
     // A focused text field owns the keyboard. ImGui already saw this event
@@ -1109,7 +1113,6 @@ bool runtime_ui_event(RecompRuntimeUi* ui, const SDL_Event& e) {
     const int repeat = e.type == SDL_KEYDOWN ? e.key.repeat : 0;
     if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
         switch (e.key.keysym.scancode) {
-            case SDL_SCANCODE_ESCAPE: input = RECOMP_RUNTIME_UI_INPUT_BACK; break;
             case SDL_SCANCODE_UP: input = RECOMP_RUNTIME_UI_INPUT_UP; break;
             case SDL_SCANCODE_DOWN: input = RECOMP_RUNTIME_UI_INPUT_DOWN; break;
             case SDL_SCANCODE_LEFT: input = RECOMP_RUNTIME_UI_INPUT_LEFT; break;
@@ -2244,7 +2247,8 @@ HostWindow::Events HostWindow::pump() {
             } else if (visible_debugger && sym == SDLK_F9) {
                 ev.debug_step_frame = true;
             } else if (sym == SDLK_F10 &&
-                       (visible_debugger || std::getenv("GBARECOMP_DEBUG_CAPTURE_DIR"))) {
+                       debug_capture_enabled(visible_debugger,
+                           std::getenv("GBARECOMP_DEBUG_CAPTURE_DIR"))) {
                 ev.debug_export = true;
             } else if (sym >= SDLK_F1 && sym <= SDLK_F9) {
                 int slot = static_cast<int>(sym - SDLK_F1) + 1;

@@ -20,6 +20,7 @@
 // step_once() becomes a real `runtime_dispatch` driver.
 
 #include "runtime.h"
+#include "debug_capture_policy.h"
 #include "ram_write_override.h"
 #include "runtime_menu_preferences.h"
 #include "presentation_preferences.h"
@@ -55,6 +56,7 @@
 #include "ws_sidecar.h"
 #if defined(GBARECOMP_RUNTIME_UI)
 #include "recomp_runtime_ui.h"
+#include "runtime_menu_input.h"
 #include "recomp_graphics_preset.h"
 #endif
 
@@ -2567,7 +2569,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     const bool visible_debugger = visible_debugger_env &&
         visible_debugger_env[0] && visible_debugger_env[0] != '0';
     auto export_debugger_evidence = [&]() {
-        if (!visible_debugger || live_fb.empty()) return;
+        if (!debug_capture_enabled(visible_debugger,
+                std::getenv("GBARECOMP_DEBUG_CAPTURE_DIR")) || live_fb.empty()) return;
         const char* root_env = std::getenv("GBARECOMP_DEBUG_CAPTURE_DIR");
         const std::filesystem::path root = root_env && *root_env
             ? std::filesystem::path(root_env)
@@ -2916,6 +2919,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         runtime_ui_config.menu.title = opts.ui_title ? opts.ui_title : runtime_title;
         runtime_ui_config.menu.subtitle = opts.ui_subtitle ? opts.ui_subtitle : "Game Boy Advance runtime settings";
         runtime_ui_config.menu.theme = opts.ui_theme;
+        if (opts.launcher_organized_settings)
+            runtime_ui_config.menu.presentation_flags |= RECOMP_RUNTIME_UI_PRESENTATION_ORGANIZED;
 #if defined(RECOMP_RUNTIME_UI_HAS_PRESENTATION_FLAGS)
         if (opts.ui_touch_friendly) {
             runtime_ui_config.menu.presentation_flags |=
@@ -2965,12 +2970,14 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             runtime_ui_config.features |= RECOMP_RUNTIME_UI_STANDARD_LINEAR_FILTER;
         else {
             static const char* const scaling_choices[] = {"Original (nearest)", "Linear", "Sharp", "Smooth 2x"};
+            static const char* const organized_scaling_choices[] = {"Nearest", "Linear", "Sharp fractional", "Smooth 2x"};
             RecompRuntimeUiItem item{};
             item.key = GBARECOMP_UI_KEY_SCALING; item.section = "Graphics"; item.label = "Scaling filter";
             item.description = "Filters only the game image. Original preserves pixel edges; Sharp suits fractional sizes. Smooth 2x softly rounds edges, but is CPU-heavy and may lower FPS in widescreen combat.";
             item.type = RECOMP_RUNTIME_UI_CHOICE; item.minimum = 0;
             item.maximum = opts.launcher_expose_smooth_filter ? 3 : 2; item.step = 1;
             item.choices = scaling_choices; item.choice_count = item.maximum + 1;
+            if (opts.launcher_organized_settings) item.choices = organized_scaling_choices;
             runtime_ui_extras.push_back(item);
         }
         {
@@ -3122,6 +3129,25 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 static_cast<const RecompRuntimeUiItem*>(opts.ui_extra_items);
             runtime_ui_extras.insert(runtime_ui_extras.end(), game_items,
                                      game_items + opts.ui_extra_item_count);
+        }
+        if (opts.launcher_organized_settings) {
+            for (auto& item : runtime_ui_extras) {
+                if (item.section && !std::strcmp(item.section, "Graphics") && !item.group)
+                    item.group = "Picture";
+                if (!std::strcmp(item.key, GBARECOMP_UI_KEY_HOST_ASPECT)) {
+                    item.group = "Window & Screen"; item.label = "Aspect ratio";
+                    item.description = "Rendered width, not stretching. Applies on Resume; unsupported scenes keep native framing.";
+                } else if (!std::strcmp(item.key, GBARECOMP_UI_KEY_SCREEN_MODEL)) {
+                    item.label = "Colour profile";
+                } else if (!std::strcmp(item.key, GBARECOMP_UI_KEY_EFFECT_STRENGTH)) {
+                    item.label = "Effect strength";
+                    item.description = "Strength of the selected LCD or CRT effect.";
+                } else if (!std::strcmp(item.key, GBARECOMP_UI_KEY_SCALING)) {
+                    item.description = "Nearest preserves pixels. Linear softens. Sharp suits fractional sizes. Smooth 2x rounds edges.";
+                } else if (!std::strcmp(item.key, GBARECOMP_UI_KEY_FPS)) {
+                    item.section = "Graphics"; item.group = "Information";
+                }
+            }
         }
         runtime_ui_config.extra_items      = runtime_ui_extras.data();
         runtime_ui_config.extra_item_count = runtime_ui_extras.size();
@@ -3311,7 +3337,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // as HostWindow input without depending on desktop focus or synthetic OS
     // modifier state. Format:
     //   GBARECOMP_ASSIST_SCRIPT="1:fast_on;600:fast_off;620:save1;"
-    //                           "700:load1;800:rewind"
+    //                           "700:load1;800:rewind;820:capture"
+    // Capture uses the normal F10 policy: debugger OR a nonempty capture dir.
     // Pump indices never move backward when a state is loaded, so a script
     // cannot accidentally replay earlier actions after a restore.
     enum class AssistScriptAction {
@@ -3320,6 +3347,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         Save,
         Load,
         Rewind,
+        Capture,
         Menu,
     };
     struct AssistScriptEvent {
@@ -3361,9 +3389,11 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 event.action = AssistScriptAction::FastOff;
             } else if (action == "rewind") {
                 event.action = AssistScriptAction::Rewind;
+            } else if (action == "capture") {
+                event.action = AssistScriptAction::Capture;
             } else if (action.rfind("menu_", 0) == 0) {
                 event.action = AssistScriptAction::Menu;
-                action_valid = action == "menu_open" || action == "menu_back" ||
+                action_valid = action == "menu_open" || action == "menu_escape" || action == "menu_back" ||
                     action == "menu_pause" || action == "menu_resume" || action == "menu_reset" ||
                     action == "menu_close" || action == "menu_cancel" || action == "menu_confirm" || action == "menu_probe";
                 action_valid = action_valid || action == "menu_auto_on" || action == "menu_auto_off";
@@ -3437,12 +3467,18 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 case AssistScriptAction::Rewind:
                     ev.rewind = true;
                     break;
+                case AssistScriptAction::Capture:
+                    // Exercise the same guarded export as F10, without
+                    // requiring desktop focus or enabling debugger controls.
+                    ev.debug_export = true;
+                    break;
                 case AssistScriptAction::Menu:
 #if defined(GBARECOMP_RUNTIME_UI)
                     {
                         auto* ui = runtime_ui_context.ui;
                         const std::string key = event.label.substr(5);
                         if (key == "open") recomp_runtime_ui_open(ui);
+                        else if (key == "escape") runtime_menu_escape(ui);
                         else if (key == "back" || key == "cancel")
                             recomp_runtime_ui_handle_input(ui, RECOMP_RUNTIME_UI_INPUT_BACK, 1, 0);
                         else if (key == "confirm") {
@@ -3568,7 +3604,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             host_paused = true;
             debugger_step_requested = true;
         }
-        if (ev.debug_export && (visible_debugger || std::getenv("GBARECOMP_DEBUG_CAPTURE_DIR")))
+        if (ev.debug_export)
             export_debugger_evidence();
         // System hotkeys (config.ini [KeyMap], rebindable in the launcher).
         if (ev.toggle_fullscreen) {

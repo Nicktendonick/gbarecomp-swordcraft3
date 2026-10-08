@@ -1048,6 +1048,7 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     gi.backdrop_path = opts.launcher_backdrop;
     gi.tagline = opts.launcher_tagline;
     gi.sidebar_layout = opts.launcher_sidebar;
+    gi.organized_settings = opts.launcher_organized_settings;
     gi.settings_note = opts.launcher_settings_note;
     gi.credits_text = opts.launcher_credits_text;
     gi.credits_title = opts.launcher_credits_title;
