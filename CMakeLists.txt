@@ -182,6 +182,8 @@ endif()
 # into the executable.
 set(GBARECOMP_MINGW_RUNTIME_BIN "C:/msys64/mingw64/bin"
     CACHE PATH "Directory containing MinGW runtime DLLs for development builds")
+set(GBARECOMP_SDL2_RUNTIME_DLL "" CACHE FILEPATH
+    "Optional SDL2 DLL from the selected SDK; empty uses the MinGW runtime directory")
 
 function(gbarecomp_stage_mingw_runtime target_name)
     if(NOT TARGET "${target_name}")
@@ -198,6 +200,12 @@ function(gbarecomp_stage_mingw_runtime target_name)
             libstdc++-6.dll
             libwinpthread-1.dll)
         set(runtime_source "${GBARECOMP_MINGW_RUNTIME_BIN}/${runtime_dll}")
+        if(runtime_dll STREQUAL "SDL2.dll" AND GBARECOMP_SDL2_RUNTIME_DLL)
+            set(runtime_source "${GBARECOMP_SDL2_RUNTIME_DLL}")
+            if(NOT EXISTS "${runtime_source}")
+                message(FATAL_ERROR "gbarecomp: selected SDL2 runtime missing: ${runtime_source}")
+            endif()
+        endif()
         if(EXISTS "${runtime_source}")
             add_custom_command(TARGET "${target_name}" POST_BUILD
                 COMMAND "${CMAKE_COMMAND}" -E copy_if_different
